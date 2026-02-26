@@ -106,28 +106,19 @@ async function getInfoCached(id) {
   const now = Date.now();
   const entry = infoCache.get(id);
   if (entry && entry.expires > now) return entry.value;
-  try {
-    const info = await yt.getInfo(id);
-    infoCache.set(id, { value: info, expires: now + CACHE_TTL_MS });
-    return info;
-  } catch (err) {
-    console.error("[youtubei] getInfo error", err && err.message ? err.message : err);
-    try {
-      const sd = await yt.getStreamingData(id);
-      if (!sd) throw new Error("getStreamingData returned empty");
-      let streaming_data = null;
-      if (Array.isArray(sd)) streaming_data = { formats: sd, adaptive_formats: [] };
-      else if (sd.formats || sd.adaptive_formats) streaming_data = sd;
-      else streaming_data = { formats: Array.isArray(sd) ? sd : [sd], adaptive_formats: [] };
-      const fallbackInfo = { streaming_data };
-      infoCache.set(id, { value: fallbackInfo, expires: now + CACHE_TTL_MS });
-      console.info("[youtubei] getStreamingData fallback succeeded for", id);
-      return fallbackInfo;
-    } catch (err2) {
-      console.error("[youtubei] getStreamingData failed", err2 && err2.message ? err2.message : err2);
-      throw err;
-    }
-  }
+
+  const sd = await yt.getStreamingData(id);
+  if (!sd) throw new Error("getStreamingData returned empty");
+
+  const streaming_data =
+    sd.formats || sd.adaptive_formats
+      ? sd
+      : { formats: Array.isArray(sd) ? sd : [sd], adaptive_formats: [] };
+
+  const info = { streaming_data };
+
+  infoCache.set(id, { value: info, expires: now + CACHE_TTL_MS });
+  return info;
 }
 
 app.get("/api/stream", async (req, res) => {
