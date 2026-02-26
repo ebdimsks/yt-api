@@ -1,5 +1,4 @@
 import express from "express";
-import fetch from "node-fetch";
 import { Innertube } from "youtubei.js";
 import fs from "fs";
 import path from "path";
