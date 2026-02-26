@@ -12,6 +12,6 @@
   },
   "dependencies": {
     "express": "^4.19.0",
-    "youtubei.js": "latest"
+    "youtubei.js": "github:LuanRT/YouTube.js#main"
   }
 }

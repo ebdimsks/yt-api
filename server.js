@@ -11,6 +11,16 @@ const port = process.env.PORT || 3000;
 const CACHE_DIR = process.env.CACHE_DIR || path.resolve(process.cwd(), "cache");
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 1000 * 60 * 60);
 const MAX_CACHE_BYTES = Number(process.env.MAX_CACHE_BYTES || 5 * 1024 * 1024 * 1024);
+const FORWARD_HEADER_KEYS = new Set([
+  "content-type",
+  "content-length",
+  "accept-ranges",
+  "content-range",
+  "content-disposition",
+  "cache-control",
+  "etag",
+  "last-modified"
+]);
 
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
@@ -41,7 +51,7 @@ function parseRange(rangeHeader, size) {
   } else if (end === null) {
     end = size - 1;
   }
-  if (start > end || start < 0 || end >= size) return null;
+  if (Number.isNaN(start) || Number.isNaN(end) || start > end || start < 0 || end >= size) return null;
   return { start, end };
 }
 
@@ -55,7 +65,6 @@ async function cleanCacheIfNeeded() {
         return { p, mtime: stat.mtimeMs, size: stat.size };
       })
       .sort((a, b) => a.mtime - b.mtime);
-
     let total = files.reduce((s, f) => s + f.size, 0);
     if (total <= MAX_CACHE_BYTES) return;
     for (const f of files) {
@@ -70,23 +79,54 @@ async function cleanCacheIfNeeded() {
 
 let yt;
 (async () => {
-  yt = await Innertube.create();
+  try {
+    yt = await Innertube.create();
+  } catch (e) {
+    console.error("failed to initialize Innertube", e);
+    process.exit(1);
+  }
 })();
+
+function extractUrlFromFormat(format) {
+  if (!format) return null;
+  if (format.url) return format.url;
+  const sc = format.signatureCipher || format.signature_cipher || format.cipher || format.signature_cipher;
+  if (!sc) return null;
+  try {
+    const params = new URLSearchParams(sc);
+    const u = params.get("url") || params.get("u");
+    if (!u) return null;
+    return decodeURIComponent(u);
+  } catch (e) {
+    return null;
+  }
+}
 
 async function getInfoCached(id) {
   const now = Date.now();
   const entry = infoCache.get(id);
   if (entry && entry.expires > now) return entry.value;
-  const info = await yt.getInfo(id);
-  infoCache.set(id, { value: info, expires: now + CACHE_TTL_MS });
-  return info;
-}
-
-function pipeStreamToClients(pass, clients) {
-  for (const res of clients) {
+  try {
+    const info = await yt.getInfo(id);
+    infoCache.set(id, { value: info, expires: now + CACHE_TTL_MS });
+    return info;
+  } catch (err) {
+    console.error("[youtubei] getInfo error", err && err.message ? err.message : err);
     try {
-      pass.pipe(res);
-    } catch (e) {}
+      const sd = await yt.getStreamingData(id);
+      if (!sd) throw new Error("getStreamingData returned empty");
+      let streaming_data = null;
+      if (Array.isArray(sd)) streaming_data = { formats: sd, adaptive_formats: [] };
+      else if (sd.formats || sd.adaptive_formats) streaming_data = sd;
+      else streaming_data = { formats: Array.isArray(sd) ? sd : [sd], adaptive_formats: [] };
+      const fallbackInfo = { streaming_data };
+      infoCache.set(id, { value: fallbackInfo, expires: now + CACHE_TTL_MS });
+      console.info("[youtubei] getStreamingData fallback succeeded for", id);
+      return fallbackInfo;
+    } catch (err2) {
+      console.error("[youtubei] getStreamingData failed", err2 && err2.message ? err2.message : err2);
+      throw err;
+    }
   }
 }
 
@@ -95,37 +135,31 @@ app.get("/api/stream", async (req, res) => {
     const id = req.query.id;
     let itag = req.query.itag ? Number(req.query.itag) : null;
     if (!id) return res.status(400).json({ error: "id required" });
-
     const info = await getInfoCached(id);
-    const sd = info.streaming_data;
-    const formats = [...(sd.formats || []), ...(sd.adaptive_formats || [])];
-
+    const sd = info.streaming_data || {};
+    const formats = [...(sd.formats || []), ...(sd.adaptive_formats || [])].filter(Boolean);
+    if (!formats.length) return res.status(404).json({ error: "no formats" });
     if (!itag) {
       const nonDash = formats.find(f => f.itag === 22) || formats.find(f => f.itag === 18);
       if (nonDash) itag = nonDash.itag;
       else {
-        const dashVideo = formats.find(f => f.mime_type && f.mime_type.includes("video"));
-        if (dashVideo) itag = dashVideo.itag;
-        else itag = formats[0].itag;
+        const dashVideo = formats.find(f => f.mime_type && f.mime_type.includes("video")) || formats[0];
+        itag = dashVideo.itag;
       }
     }
-
     const format = formats.find(f => f.itag === itag);
     if (!format) return res.status(404).json({ error: "itag not found" });
-
-    const url = format.url;
+    const url = extractUrlFromFormat(format);
     const range = req.headers.range;
     const key = cacheKeyForMedia(id, format.itag);
     const finalPath = cacheFilePath(key);
     const tmpPathFile = tmpFilePath(key);
-
     if (fs.existsSync(finalPath)) {
       const stat = fs.statSync(finalPath);
       const size = stat.size;
       res.setHeader("Accept-Ranges", "bytes");
-      const contentType = (format.mime_type && format.mime_type.split(";")[0]) || "application/octet-stream";
+      const contentType = (format.mime_type || format.mimeType || "").split(";")[0] || "application/octet-stream";
       res.setHeader("Content-Type", contentType);
-
       if (range) {
         const r = parseRange(range, size);
         if (!r) return res.status(416).setHeader("Content-Range", `bytes */${size}`).end();
@@ -143,45 +177,42 @@ app.get("/api/stream", async (req, res) => {
         return;
       }
     }
-
+    if (!url) return res.status(422).json({ error: "format has no direct url" });
     const existing = inProgress.get(key);
     if (existing && !range) {
       try {
         await existing.ready;
       } catch (e) {
-        return res.status(500).json({ error: "upstream error" });
+        return res.status(502).json({ error: "upstream error" });
       }
-
       res.status(existing.status || 200);
-      for (const h of Object.keys(existing.headers || {})) {
-        try { res.setHeader(h, existing.headers[h]); } catch (e) {}
+      for (const [k, v] of Object.entries(existing.headers || {})) {
+        try { res.setHeader(k, v); } catch (e) {}
       }
       existing.clients.add(res);
-
       existing.pass.pipe(res);
-
       const onClose = () => {
         existing.clients.delete(res);
         try { existing.pass.unpipe(res); } catch (e) {}
       };
-      res.on("close", onClose);
-      res.on("finish", onClose);
+      res.once("close", onClose);
+      res.once("finish", onClose);
       return;
     }
-
     if (range) {
       const upstreamHeaders = { Range: range };
       const gvRes = await fetch(url, { headers: upstreamHeaders });
       res.status(gvRes.status);
-      gvRes.headers.forEach((v, k) => res.setHeader(k, v));
+      for (const [k, v] of gvRes.headers) {
+        try { res.setHeader(k, v); } catch (e) {}
+      }
       gvRes.body.pipe(res);
+      gvRes.body.on("error", () => { try { res.destroy(); } catch (e) {} });
       return;
     }
-
     let resolveReady;
     let rejectReady;
     const ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
-
     const pass = new PassThrough();
     const entry = {
       pass,
@@ -196,34 +227,30 @@ app.get("/api/stream", async (req, res) => {
       aborted: false
     };
     inProgress.set(key, entry);
-
     const gvRes = await fetch(url);
     const headersObj = {};
-    gvRes.headers.forEach((v, k) => headersObj[k] = v);
-
+    for (const [k, v] of gvRes.headers) {
+      const lk = k.toLowerCase();
+      if (FORWARD_HEADER_KEYS.has(lk)) headersObj[lk] = v;
+    }
     entry.headers = headersObj;
     entry.status = gvRes.status;
     entry.resolveReady();
-
     const writeStream = fs.createWriteStream(tmpPathFile);
-
     res.status(gvRes.status);
-    for (const h of Object.keys(headersObj)) {
-      try { res.setHeader(h, headersObj[h]); } catch (e) {}
+    for (const [k, v] of Object.entries(headersObj)) {
+      try { res.setHeader(k, v); } catch (e) {}
     }
     entry.clients.add(res);
-
     gvRes.body.pipe(pass);
     pass.pipe(res);
     pass.pipe(writeStream);
-
-    const onCloseFirst = () => {
+    const onClientClose = () => {
       entry.clients.delete(res);
       try { pass.unpipe(res); } catch (e) {}
     };
-    res.on("close", onCloseFirst);
-    res.on("finish", onCloseFirst);
-
+    res.once("close", onClientClose);
+    res.once("finish", onClientClose);
     gvRes.body.on("end", async () => {
       try {
         try { writeStream.end(); } catch (e) {}
@@ -235,7 +262,6 @@ app.get("/api/stream", async (req, res) => {
         inProgress.delete(key);
       }
     });
-
     gvRes.body.on("error", err => {
       try { writeStream.destroy(); } catch (e) {}
       try { if (fs.existsSync(tmpPathFile)) fs.unlinkSync(tmpPathFile); } catch (e) {}
@@ -248,10 +274,9 @@ app.get("/api/stream", async (req, res) => {
       }
       inProgress.delete(key);
     });
-
     return;
   } catch (e) {
-    res.status(500).json({ error: "proxy error" });
+    try { res.status(500).json({ error: "proxy error" }); } catch (e2) {}
   }
 });
 
