@@ -3,7 +3,18 @@ import { Innertube } from "youtubei.js";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import fetch from "node-fetch";
+import { HttpsProxyAgent } from "https-proxy-agent";
 import { PassThrough, Readable } from "stream";
+
+const PROXY = process.env.PROXY_URL || null;
+const proxyAgent = PROXY ? new HttpsProxyAgent(PROXY) : null;
+
+async function proxyFetch(input, init = {}) {
+  const opts = { ...(init || {}) };
+  if (proxyAgent) opts.agent = proxyAgent;
+  return fetch(input, opts);
+}
 
 if (!process.env.WORKER_SECRET) {
   console.error("WORKER_SECRET is required");
@@ -29,7 +40,11 @@ const WORKER_SECRET = process.env.WORKER_SECRET;
 
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-let ytPromise = Innertube.create({ client_type: "ANDROID", generate_session_locally: true });
+let ytPromise = Innertube.create({
+  client_type: "ANDROID",
+  generate_session_locally: true,
+  fetch: proxyFetch
+});
 let ytClient;
 async function getYtClient() {
   if (!ytClient) ytClient = await ytPromise;
