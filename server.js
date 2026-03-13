@@ -2,17 +2,18 @@ import express from "express";
 import { Innertube } from "youtubei.js";
 import crypto from "crypto";
 
-if (!process.env.WORKER_SECRET) {
-  console.error("WORKER_SECRET is required");
-  process.exit(1);
-}
-
 const app = express();
 const port = process.env.PORT || 3000;
 
 const WORKER_SECRET = process.env.WORKER_SECRET;
+
+if (!WORKER_SECRET) {
+  console.error("WORKER_SECRET required");
+  process.exit(1);
+}
+
 const ALLOWED_WINDOW = 300;
-const INSTANCE_BAN_MS = 5 * 60 * 1000;
+const INSTANCE_BAN_MS = 300000;
 
 /* ---------------- Instances ---------------- */
 
@@ -45,83 +46,71 @@ const PIPED_INSTANCES = [
   "https://pipedapi.orangenet.cc",
 ];
 
-/* ---------------- Innertube ---------------- */
+/* ---------------- Health ---------------- */
 
-let ytClient;
+const bad = new Map();
 
-async function getYtClient() {
-  if (!ytClient) {
-    ytClient = await Innertube.create({
-      client_type: "ANDROID",
-      generate_session_locally: true
-    });
-  }
-  return ytClient;
+function markBad(url){
+  bad.set(url,Date.now());
 }
 
-/* ---------------- Instance Health ---------------- */
+function isBad(url){
 
-const badInstances = new Map();
-const nextIndex = { invidious: 0, piped: 0 };
+  const t = bad.get(url);
 
-function markBad(instance) {
-  badInstances.set(instance, Date.now());
-}
+  if(!t) return false;
 
-function isBad(instance) {
-  const t = badInstances.get(instance);
-  if (!t) return false;
-
-  if (Date.now() - t > INSTANCE_BAN_MS) {
-    badInstances.delete(instance);
+  if(Date.now()-t > INSTANCE_BAN_MS){
+    bad.delete(url);
     return false;
   }
 
   return true;
+
 }
 
-function rotateInstances(list, key) {
-  const idx = nextIndex[key] % list.length;
-  nextIndex[key] = (idx + 1) % list.length;
+/* ---------------- Utils ---------------- */
 
-  const rotated = [...list.slice(idx), ...list.slice(0, idx)];
-  const good = rotated.filter(i => !isBad(i));
+function normalizeUrl(base,url){
 
-  return good.length ? good : rotated;
+  if(!url) return null;
+
+  if(url.startsWith("http"))
+    return url;
+
+  return base + url;
+
 }
 
-/* ---------------- HLS Utilities ---------------- */
+/* ---------------- HLS ---------------- */
 
-async function resolveHlsVariant(manifestUrl) {
+async function resolveHls(master){
 
-  try {
+  try{
 
-    const res = await fetch(manifestUrl);
-    if (!res.ok) return manifestUrl;
+    const r = await fetch(master);
+    if(!r.ok) return master;
 
-    const text = await res.text();
+    const text = await r.text();
     const lines = text.split("\n");
 
-    const variants = [];
+    const variants=[];
 
-    for (let i = 0; i < lines.length; i++) {
+    for(let i=0;i<lines.length;i++){
 
-      const line = lines[i];
+      if(lines[i].startsWith("#EXT-X-STREAM-INF")){
 
-      if (line.startsWith("#EXT-X-STREAM-INF")) {
+        const next = lines[i+1];
 
-        const next = lines[i + 1];
+        const m = lines[i].match(/RESOLUTION=(\d+)x(\d+)/);
 
-        const match = line.match(/RESOLUTION=(\d+)x(\d+)/);
-        const height = match ? Number(match[2]) : 0;
+        const h = m ? Number(m[2]) : 0;
 
-        if (next && !next.startsWith("#")) {
-
-          const url = new URL(next, manifestUrl).href;
+        if(next && !next.startsWith("#")){
 
           variants.push({
-            url,
-            height
+            height:h,
+            url:new URL(next,master).href
           });
 
         }
@@ -130,177 +119,150 @@ async function resolveHlsVariant(manifestUrl) {
 
     }
 
-    if (!variants.length) return manifestUrl;
+    if(!variants.length) return master;
 
     variants.sort((a,b)=>b.height-a.height);
 
     return variants[0].url;
 
-  } catch {
-    return manifestUrl;
+  }catch{
+
+    return master;
+
   }
 
 }
 
-/* ---------------- Format Utilities ---------------- */
+/* ---------------- Format Helpers ---------------- */
 
-function parseUrl(format) {
+function parseUrl(f){
 
-  if (format.url) return format.url;
+  if(f.url) return f.url;
 
   const cipher =
-    format.signatureCipher ||
-    format.signature_cipher ||
-    format.cipher;
+    f.signatureCipher ||
+    f.signature_cipher ||
+    f.cipher;
 
-  if (!cipher) return null;
+  if(!cipher) return null;
 
-  try {
-    return new URLSearchParams(cipher).get("url");
-  } catch {
-    return null;
-  }
+  return new URLSearchParams(cipher).get("url");
 
 }
 
-function normalizeFormats(sd) {
+function normalizeFormats(sd){
 
   return [
-    ...(sd.formats || []),
-    ...(sd.adaptive_formats || [])
-  ].map(f => ({
+    ...(sd.formats||[]),
+    ...(sd.adaptive_formats||[])
+  ].map(f=>({
     ...f,
-    mime: (f.mimeType || f.mime_type || "").toLowerCase()
+    mime:(f.mimeType||f.mime_type||"").toLowerCase()
   }));
 
 }
 
-function selectBestVideo(formats) {
+function bestVideo(formats){
 
   return formats
-    .filter(f => f.mime.includes("video"))
-    .sort((a,b)=>
-      (b.height || 0) - (a.height || 0) ||
-      (b.bitrate || 0) - (a.bitrate || 0)
-    )[0] || null;
+    .filter(f=>f.mime.includes("video"))
+    .sort((a,b)=>(b.height||0)-(a.height||0))[0];
 
 }
 
-function selectBestAudio(formats) {
+function bestAudio(formats){
 
   return formats
-    .filter(f => f.mime.includes("audio"))
-    .sort((a,b)=>
-      (b.bitrate || 0) - (a.bitrate || 0)
-    )[0] || null;
+    .filter(f=>f.mime.includes("audio"))
+    .sort((a,b)=>(b.bitrate||0)-(a.bitrate||0))[0];
 
 }
 
-function selectBestProgressive(formats) {
+function bestProgressive(formats){
 
   return formats
-    .filter(f =>
-      f.mime.includes("video") &&
-      /mp4a|aac|opus/.test(f.mime)
-    )
-    .sort((a,b)=>
-      (b.height || 0) - (a.height || 0)
-    )[0] || null;
+    .filter(f=>f.mime.includes("video") && /mp4a|aac|opus/.test(f.mime))
+    .sort((a,b)=>(b.height||0)-(a.height||0))[0];
 
 }
 
-/* ---------------- Parallel Fetch ---------------- */
+/* ---------------- Instance Racing ---------------- */
 
-async function fastestFetch(instances, buildUrl, parser) {
+async function fastest(list,build,parser){
 
-  const controllers = [];
+  const controllers=[];
 
-  const tasks = instances.map(async base => {
+  const tasks=list
+    .filter(i=>!isBad(i))
+    .map(async base=>{
 
-    const controller = new AbortController();
-    controllers.push(controller);
+      const c=new AbortController();
+      controllers.push(c);
 
-    try {
+      try{
 
-      const res = await fetch(buildUrl(base), {
-        signal: controller.signal
-      });
+        const r = await fetch(build(base),{signal:c.signal});
 
-      if (!res.ok) {
+        if(!r.ok) throw 0;
+
+        const j = await r.json();
+
+        const parsed = parser(j,base);
+
+        if(!parsed) throw 0;
+
+        return parsed;
+
+      }catch{
+
         markBad(base);
-        throw new Error();
+        throw 0;
+
       }
 
-      const data = await res.json();
-      const parsed = parser(data);
+    });
 
-      if (!parsed) throw new Error();
+  const res = await Promise.any(tasks);
 
-      return parsed;
+  controllers.forEach(c=>c.abort());
 
-    } catch {
-
-      markBad(base);
-      throw new Error();
-
-    }
-
-  });
-
-  const result = await Promise.any(tasks);
-
-  controllers.forEach(c => c.abort());
-
-  return result;
+  return res;
 
 }
 
 /* ---------------- Providers ---------------- */
 
-async function fetchFromInvidious(id) {
+async function fromInvidious(id){
 
-  const instances = rotateInstances(
-    INVIDIOUS_INSTANCES,
-    "invidious"
-  );
+  return fastest(
+    INVIDIOUS,
+    b=>`${b}/api/v1/videos/${id}`,
+    (d,b)=>{
 
-  return fastestFetch(
-    instances,
-    base => `${base}/api/v1/videos/${id}`,
-    data => {
+      if(d.hlsUrl){
 
-      if (data.hlsUrl) {
-
-        const url = data.hlsUrl.startsWith("http")
-          ? data.hlsUrl
-          : base + data.hlsUrl;
-
-        return {
-          provider: "invidious",
-          streaming_data: {
-            hlsManifestUrl: url
+        return{
+          provider:"invidious",
+          streaming_data:{
+            hlsManifestUrl:normalizeUrl(b,d.hlsUrl)
           }
         };
 
       }
 
-      const formats = [];
+      const formats=[];
 
-      if (data.formatStreams)
-        data.formatStreams.forEach(f =>
-          formats.push({ ...f, mimeType: f.type })
-        );
+      if(d.formatStreams)
+        d.formatStreams.forEach(f=>formats.push({...f,mimeType:f.type}));
 
-      if (data.adaptiveFormats)
-        data.adaptiveFormats.forEach(f =>
-          formats.push({ ...f, mimeType: f.type })
-        );
+      if(d.adaptiveFormats)
+        d.adaptiveFormats.forEach(f=>formats.push({...f,mimeType:f.type}));
 
-      if (!formats.length) return null;
+      if(!formats.length) return null;
 
-      return {
-        provider: "invidious",
-        streaming_data: { formats }
+      return{
+        provider:"invidious",
+        streaming_data:{formats}
       };
 
     }
@@ -308,40 +270,34 @@ async function fetchFromInvidious(id) {
 
 }
 
-async function fetchFromPiped(id) {
+async function fromPiped(id){
 
-  const instances = rotateInstances(
-    PIPED_INSTANCES,
-    "piped"
-  );
+  return fastest(
+    PIPED,
+    b=>`${b}/streams/${id}`,
+    (d,b)=>{
 
-  return fastestFetch(
-    instances,
-    base => `${base}/streams/${id}`,
-    data => {
+      if(d.hls){
 
-      if (data.hls) {
-
-        return {
-          provider: "piped",
-          streaming_data: { hlsManifestUrl: data.hls }
+        return{
+          provider:"piped",
+          streaming_data:{
+            hlsManifestUrl:normalizeUrl(b,d.hls)
+          }
         };
 
       }
 
-      const formats = [];
+      const formats=[
+        ...(d.videoStreams||[]),
+        ...(d.audioStreams||[])
+      ];
 
-      if (data.videoStreams)
-        data.videoStreams.forEach(v => formats.push(v));
+      if(!formats.length) return null;
 
-      if (data.audioStreams)
-        data.audioStreams.forEach(a => formats.push(a));
-
-      if (!formats.length) return null;
-
-      return {
-        provider: "piped",
-        streaming_data: { formats }
+      return{
+        provider:"piped",
+        streaming_data:{formats}
       };
 
     }
@@ -349,27 +305,36 @@ async function fetchFromPiped(id) {
 
 }
 
-async function fetchFromInnertube(id) {
+let yt;
 
-  const client = await getYtClient();
-  const info = await client.getInfo(id);
+async function fromInnertube(id){
 
-  if (!info?.streaming_data)
-    throw new Error("No streaming data");
+  if(!yt){
 
-  return {
-    provider: "innertube",
-    streaming_data: info.streaming_data
+    yt = await Innertube.create({
+      client_type:"ANDROID",
+      generate_session_locally:true
+    });
+
+  }
+
+  const info = await yt.getInfo(id);
+
+  return{
+    provider:"innertube",
+    streaming_data:info.streaming_data
   };
 
 }
 
-async function fetchStreamingInfo(id) {
+/* ---------------- Fetch Router ---------------- */
 
-  try { return await fetchFromInvidious(id); } catch {}
-  try { return await fetchFromPiped(id); } catch {}
+async function getStreaming(id){
 
-  return fetchFromInnertube(id);
+  try{ return await fromInvidious(id); }catch{}
+  try{ return await fromPiped(id); }catch{}
+
+  return fromInnertube(id);
 
 }
 
@@ -377,36 +342,36 @@ async function fetchStreamingInfo(id) {
 
 function safeEqual(a,b){
 
-  const A = Buffer.from(a,"hex");
-  const B = Buffer.from(b,"hex");
+  const A=Buffer.from(a,"hex");
+  const B=Buffer.from(b,"hex");
 
-  if (A.length !== B.length) return false;
+  if(A.length!==B.length) return false;
 
   return crypto.timingSafeEqual(A,B);
 
 }
 
-function verifyWorkerAuth(req,res,next){
+function auth(req,res,next){
 
-  const ts = req.header("x-proxy-timestamp");
-  const sig = req.header("x-proxy-signature");
+  const ts=req.header("x-proxy-timestamp");
+  const sig=req.header("x-proxy-signature");
 
-  if (!ts || !sig)
+  if(!ts||!sig)
     return res.status(401).json({error:"unauthorized"});
 
-  const now = Math.floor(Date.now()/1000);
+  const now=Math.floor(Date.now()/1000);
 
-  if (Math.abs(now - Number(ts)) > ALLOWED_WINDOW)
+  if(Math.abs(now-Number(ts))>ALLOWED_WINDOW)
     return res.status(401).json({error:"unauthorized"});
 
-  const payload = `${ts}:${req.originalUrl}`;
+  const payload=`${ts}:${req.originalUrl}`;
 
-  const expected = crypto
-    .createHmac("sha256", WORKER_SECRET)
+  const expected=crypto
+    .createHmac("sha256",WORKER_SECRET)
     .update(payload)
     .digest("hex");
 
-  if (!safeEqual(expected, sig))
+  if(!safeEqual(expected,sig))
     return res.status(401).json({error:"unauthorized"});
 
   next();
@@ -415,19 +380,17 @@ function verifyWorkerAuth(req,res,next){
 
 /* ---------------- API ---------------- */
 
-app.get("/api/stream", verifyWorkerAuth, async (req,res)=>{
+app.get("/api/stream",auth,async(req,res)=>{
 
   try{
 
-    const id = req.query.id;
+    const id=req.query.id;
 
-    if (!id)
+    if(!id)
       return res.status(400).json({error:"id required"});
 
-    const info = await fetchStreamingInfo(id);
+    const info = await getStreaming(id);
     const sd = info.streaming_data;
-
-    /* HLS */
 
     const hls =
       sd.hlsManifestUrl ||
@@ -435,65 +398,59 @@ app.get("/api/stream", verifyWorkerAuth, async (req,res)=>{
       sd.hlsUrl ||
       sd.hls;
 
-    if (hls) {
+    if(hls){
 
-      const variant = await resolveHlsVariant(hls);
+      const url = await resolveHls(hls);
 
       return res.json({
-        type: "hls",
-        url: variant,
-        manifest: hls,
-        provider: info.provider
+        type:"hls",
+        url,
+        manifest:hls,
+        provider:info.provider
       });
 
     }
 
     const formats = normalizeFormats(sd);
 
-    /* DASH */
+    const v = bestVideo(formats);
+    const a = bestAudio(formats);
 
-    const video = selectBestVideo(formats);
-    const audio = selectBestAudio(formats);
-
-    if (video && audio) {
+    if(v && a){
 
       return res.json({
         type:"dash",
-        quality: video.height || null,
-        video_url: parseUrl(video),
-        audio_url: parseUrl(audio),
-        provider: info.provider
+        quality:v.height,
+        video_url:parseUrl(v),
+        audio_url:parseUrl(a),
+        provider:info.provider
       });
 
     }
 
-    /* Progressive */
+    const p = bestProgressive(formats);
 
-    const progressive = selectBestProgressive(formats);
-
-    if (progressive) {
+    if(p){
 
       return res.json({
         type:"progressive",
-        quality: progressive.height || null,
-        url: parseUrl(progressive),
-        provider: info.provider
+        quality:p.height,
+        url:parseUrl(p),
+        provider:info.provider
       });
 
     }
 
-    return res.status(404).json({error:"no stream"});
+    res.status(404).json({error:"no stream"});
 
-  } catch(e){
+  }catch(e){
 
-    return res.status(500).json({
-      error: e.message
-    });
+    res.status(500).json({error:e.message});
 
   }
 
 });
 
 app.listen(port,()=>{
-  console.log(`Server running on ${port}`);
+  console.log("server running",port);
 });
