@@ -10,7 +10,7 @@ const { pipeline } = stream.promises;
 const PORT = process.env.PORT || 3000;
 const WORKER_SECRET = process.env.WORKER_SECRET;
 const UPSTREAM_TIMEOUT_MS = 30000; // 30s
-const INSTANCE_BAN_MS = 5 * 60 * 1000);
+const INSTANCE_BAN_MS = 5 * 60 * 1000;
 const ALLOWED_WINDOW = 300;
 const CACHE_DIR = path.join(process.cwd(), "cache");
 
