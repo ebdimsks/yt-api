@@ -1,60 +1,82 @@
+let cachedKey = null;
+
+async function getHmacKey(secret) {
+  if (cachedKey) return cachedKey;
+
+  const enc = new TextEncoder();
+  cachedKey = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  return cachedKey;
+}
+
+async function hmacHex(secret, msg) {
+  const key = await getHmacKey(secret);
+
+  const sig = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(msg)
+  );
+
+  const bytes = new Uint8Array(sig);
+
+  let hex = "";
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, "0");
+  }
+
+  return hex;
+}
+
 export default {
   async fetch(request, env) {
-    const required = ["WORKER_SECRET", "SERVER_URL"];
-    for (const key of required) {
-      if (!env[key]) return new Response(`${key} required`, { status: 500 });
+
+    if (!env.WORKER_SECRET || !env.SERVER_URL) {
+      return new Response("Server not configured", { status: 500 });
     }
 
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Headers": "*",
-          "Access-Control-Allow-Methods": "GET, OPTIONS"
-        }
+        headers: corsHeaders()
       });
     }
 
     const url = new URL(request.url);
-    const target = new URL(env.SERVER_URL);
-    target.pathname = "/api/stream";
-    target.search = url.search;
+    const target = `${env.SERVER_URL}/api/stream${url.search}`;
 
     const ts = Math.floor(Date.now() / 1000);
+    const payload = `${ts}:/api/stream${url.search}`;
 
-    async function hmacHex(secret, msg) {
-      const enc = new TextEncoder();
-      const keyData = enc.encode(secret);
-      const imported = await crypto.subtle.importKey("raw", keyData, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-      const sig = await crypto.subtle.sign("HMAC", imported, enc.encode(msg));
-      const b = new Uint8Array(sig);
-      let hex = "";
-      for (let i = 0; i < b.length; i++) {
-        const h = b[i].toString(16);
-        hex += (h.length === 1 ? "0" : "") + h;
-      }
-      return hex;
-    }
-
-    const payload = `${ts}:${target.pathname}${target.search}`;
     const signature = await hmacHex(env.WORKER_SECRET, payload);
 
-    const outHeaders = new Headers(request.headers);
-    outHeaders.set("x-proxy-timestamp", String(ts));
-    outHeaders.set("x-proxy-signature", signature);
-
-    const nodeRes = await fetch(target.toString(), {
-      method: "GET",
-      headers: outHeaders
+    const nodeRes = await fetch(target, {
+      headers: {
+        "x-proxy-timestamp": ts.toString(),
+        "x-proxy-signature": signature
+      }
     });
 
-    const headers = new Headers(nodeRes.headers);
-    headers.set("Access-Control-Allow-Origin", "*");
-    headers.set("Access-Control-Allow-Headers", "*");
     return new Response(nodeRes.body, {
       status: nodeRes.status,
-      headers
+      headers: {
+        ...corsHeaders(),
+        "content-type": nodeRes.headers.get("content-type") || "application/json"
+      }
     });
   }
 };
+
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS"
+  };
+}
