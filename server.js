@@ -190,22 +190,33 @@ function selectBestProgressive(formats){
 }
 
 /* -------------------------------------------------- */
-/* HLS Rejection */
+/* フォーマット判定 */
 /* -------------------------------------------------- */
 
-function rejectHLS(streamingData){
+function isSupportedFormat(f) {
 
+  const url = f.url || parseUrl(f);
+  if (!url) return false;
+
+  const mime = (f.mimeType || f.mime_type || "").toLowerCase();
+
+  // -----------------------------
+  // DASH / Progressive 判定
+  // -----------------------------
   if (
-    streamingData?.hlsManifestUrl ||
-    streamingData?.hls_manifest_url
+    mime.includes("video/mp4") ||
+    mime.includes("audio/mp4") ||
+    mime.includes("video/webm") ||
+    mime.includes("audio/webm") ||
+    /audio\/opus|audio\/aac|audio\/mp3/.test(mime)
   ) {
-
-    const err = new Error("HLS streams are not supported");
-    err.status = 415;
-
-    throw err;
+    return true;
   }
 
+  // -----------------------------
+  // その他は非対応
+  // -----------------------------
+  return false;
 }
 
 /* -------------------------------------------------- */
@@ -379,29 +390,40 @@ function verifyWorkerAuth(req,res,next){
 /* API */
 /* -------------------------------------------------- */
 
-app.get("/api/stream", verifyWorkerAuth, async (req,res)=>{
-
-  try{
-
+app.get("/api/stream", verifyWorkerAuth, async (req, res) => {
+  try {
     const id = req.query.id;
+    if (!id) return res.status(400).json({ error: "id required" });
 
-    if (!id)
-      return res.status(400).json({error:"id required"});
-
+    // -----------------------
+    // 1. Streaming info 取得
+    // -----------------------
     const info = await fetchStreamingInfo(id);
     const sd = info.streaming_data;
 
-    rejectHLS(sd);
+    // -----------------------
+    // 2. フォーマットをサニタイズ
+    // DASH/Progressiveのみ残す
+    // -----------------------
+    const formats = [...(sd.formats || []), ...(sd.adaptive_formats || [])]
+      .filter(isSupportedFormat)
+      .map(f => ({ ...f, mime: (f.mimeType || f.mime_type || "").toLowerCase() }));
 
-    const formats = normalizeFormats(sd);
+    if (!formats.length) {
+      return res.status(415).json({
+        error: "No supported stream formats available (DASH/Progressive only, HLS rejected)"
+      });
+    }
 
+    // -----------------------
+    // 3. 最高画質の選択
+    // -----------------------
     const video = selectBestVideo(formats);
     const audio = selectBestAudio(formats);
 
-    if (video && audio){
-
+    if (video && audio) {
       return res.json({
-        type:"dash",
+        type: "dash",
         quality: video.height || null,
         video_url: parseUrl(video),
         audio_url: parseUrl(audio),
@@ -409,33 +431,25 @@ app.get("/api/stream", verifyWorkerAuth, async (req,res)=>{
         audio_itag: audio.itag,
         provider: info.provider
       });
-
     }
 
     const progressive = selectBestProgressive(formats);
 
-    if (progressive){
-
+    if (progressive) {
       return res.json({
-        type:"progressive",
+        type: "progressive",
         quality: progressive.height || null,
         url: parseUrl(progressive),
         itag: progressive.itag,
         provider: info.provider
       });
-
     }
 
-    return res.status(404).json({error:"no stream"});
+    return res.status(404).json({ error: "no stream available" });
 
-  }catch(e){
-
-    return res.status(e.status || 500).json({
-      error: e.message
-    });
-
+  } catch (e) {
+    return res.status(e.status || 500).json({ error: e.message });
   }
-
 });
 
 /* -------------------------------------------------- */
