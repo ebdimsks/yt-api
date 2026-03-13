@@ -270,10 +270,18 @@ async function fetchFromInvidious(id) {
     data => {
 
       if (data.hlsUrl) {
+
+        const url = data.hlsUrl.startsWith("http")
+          ? data.hlsUrl
+          : base + data.hlsUrl;
+
         return {
           provider: "invidious",
-          streaming_data: { hlsManifestUrl: data.hlsUrl }
+          streaming_data: {
+            hlsManifestUrl: url
+          }
         };
+
       }
 
       const formats = [];
