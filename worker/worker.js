@@ -49,10 +49,14 @@ export default {
     }
 
     const url = new URL(request.url);
-    const target = `${env.SERVER_URL}/api/stream${url.search}`;
+
+    const path = `${url.pathname}${url.search}`;
+
+    const target = `${env.SERVER_URL}${path}`;
 
     const ts = Math.floor(Date.now() / 1000);
-    const payload = `${ts}:/api/stream${url.search}`;
+
+    const payload = `${ts}:${path}`;
 
     const signature = await hmacHex(env.WORKER_SECRET, payload);
 
