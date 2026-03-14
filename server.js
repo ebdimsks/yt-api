@@ -106,42 +106,179 @@ const selectBestProgressive = (formats) =>
     .filter((f) => f.mime.includes('video') && /mp4a|aac|opus/.test(f.mime))
     .sort((a, b) => (b.height || 0) - (a.height || 0))[0] || null;
 
-/* ---------------- Parallel fetch to multiple Invidious instances ---------------- */
-const fastestFetch = async (instances, buildUrl, parser) => {
-  const controllers = [];
+/* ---------------- Network helpers (fetch with timeout) ---------------- */
+const timeout = (ms) => new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms));
 
-  const tasks = instances.map(async (base) => {
-    const controller = new AbortController();
-    controllers.push(controller);
+const fetchWithTimeout = async (url, opts = {}, ms = 5000) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    const res = await fetch(url, { signal: controller.signal, ...opts });
+    clearTimeout(timer);
+    return res;
+  } catch (e) {
+    clearTimeout(timer);
+    throw e;
+  }
+};
 
-    try {
-      const res = await fetch(buildUrl(base), { signal: controller.signal });
+/* ---------------- CDN verification ---------------- */
+const verifyCdn = async (url, timeoutMs = 4000) => {
+  if (!url) return false;
 
-      if (!res.ok) {
-        markBad(base);
-        throw new Error('bad response');
-      }
+  try {
+    // try HEAD first
+    const headRes = await fetchWithTimeout(url, { method: 'HEAD', redirect: 'follow' }, timeoutMs);
+    if (headRes && headRes.status === 200) return true;
 
-      const data = await res.json();
-      const parsed = parser(data);
-
-      if (!parsed) {
-        markBad(base);
-        throw new Error('parse failed');
-      }
-
-      return { instance: base, data: parsed };
-    } catch (err) {
-      markBad(base);
-      throw err;
+    // Some CDNs reject HEAD. Fall back to small-range GET
+    if (headRes && [405, 501].includes(headRes.status)) {
+      // fall through to range GET
+    } else if (headRes && headRes.status >= 400) {
+      // non-200 HEAD (e.g., 403) — still try range GET as a fallback
     }
+  } catch (e) {
+    // network error or aborted -> fall back to range
+  }
+
+  try {
+    const rangeRes = await fetchWithTimeout(url, {
+      method: 'GET',
+      headers: { Range: 'bytes=0-0' },
+      redirect: 'follow',
+    }, timeoutMs);
+    if (rangeRes && (rangeRes.status === 206 || rangeRes.status === 200)) return true;
+  } catch (e) {
+    // failed
+  }
+
+  return false;
+};
+
+/* ---------------- Parallel fetch-to-instances but process in order-of-arrival ---------------- */
+const fastestFetch = async (instances, buildUrl, parser) => {
+  if (!instances || instances.length === 0) throw new Error('no instances');
+
+  // create per-instance tasks that always resolve to an object (no rejection)
+  const wrappers = instances.map((base) => {
+    const controller = new AbortController();
+
+    const taskPromise = (async () => {
+      try {
+        const res = await fetch(buildUrl(base), { signal: controller.signal });
+        if (!res.ok) {
+          // markBad later after we settle — but early mark is fine
+          return { ok: false, instance: base, error: new Error(`status ${res.status}`) };
+        }
+
+        const data = await res.json();
+        const parsed = parser(data);
+
+        if (!parsed) {
+          return { ok: false, instance: base, error: new Error('parse failed') };
+        }
+
+        return { ok: true, instance: base, streaming_data: parsed.streaming_data };
+      } catch (err) {
+        return { ok: false, instance: base, error: err };
+      }
+    })();
+
+    return { base, controller, promise: taskPromise };
   });
 
-  const result = await Promise.any(tasks);
+  // We'll handle results as they resolve (in completion order)
+  const remaining = new Set(wrappers.map((w) => w.base));
 
-  controllers.forEach((c) => c.abort());
+  while (remaining.size > 0) {
+    // build array of promises that resolve to the wrapper result (instance included)
+    const races = [...wrappers]
+      .filter((w) => remaining.has(w.base))
+      .map((w) =>
+        w.promise.then((v) => ({ ...v })) // copy to avoid accidental mutation
+      );
 
-  return result;
+    // Wait for the next promise to settle (fulfilled) — since our promises never reject,
+    // the next resolved item is the next finished HTTP response.
+    const result = await Promise.race(races);
+
+    // remove this instance from remaining
+    remaining.delete(result.instance);
+
+    if (!result.ok) {
+      // mark instance bad and continue
+      markBad(result.instance);
+      continue;
+    }
+
+    const sd = result.streaming_data || {};
+    const formats = normalizeFormats(sd);
+
+    // Build candidate URL sets to check.
+    // Priority: DASH (video+audio) -> progressive
+    const video = selectBestVideo(formats);
+    const audio = selectBestAudio(formats);
+    const progressive = selectBestProgressive(formats);
+
+    let ok = false;
+
+    // Helper to verify one or multiple URLs
+    const verifyUrls = async (urls) => {
+      for (const u of urls) {
+        if (!u) return false;
+      }
+      // verify all individually
+      for (const u of urls) {
+        const parsed = parseUrl(u);
+        if (!parsed) return false;
+        const yes = await verifyCdn(parsed);
+        if (!yes) return false;
+      }
+      return true;
+    };
+
+    try {
+      if (video && audio) {
+        const vUrl = parseUrl(video);
+        const aUrl = parseUrl(audio);
+        if (vUrl && aUrl) {
+          const bothOk = await verifyUrls([vUrl, aUrl]);
+          if (bothOk) ok = true;
+        }
+      }
+
+      if (!ok && progressive) {
+        const pUrl = parseUrl(progressive);
+        if (pUrl) {
+          const pOk = await verifyUrls([pUrl]);
+          if (pOk) ok = true;
+        }
+      }
+    } catch (e) {
+      // treat as failure for this instance
+      ok = false;
+    }
+
+    if (ok) {
+      // Abort all other in-flight requests
+      wrappers.forEach((w) => {
+        try {
+          w.controller.abort();
+        } catch {}
+      });
+
+      return {
+        instance: result.instance,
+        streaming_data: sd,
+      };
+    }
+
+    // CDN verification failed for this instance -> mark bad and continue loop to next finished instance
+    markBad(result.instance);
+  }
+
+  // none worked
+  throw new Error('no valid instance');
 };
 
 /* ---------------- Providers ---------------- */
@@ -154,8 +291,8 @@ const fetchFromInvidious = async (id) => {
     (data) => {
       const formats = [];
 
-      (data.formatStreams || []).forEach((f) => formats.push({ ...f, mimeType: f.type }));
-      (data.adaptiveFormats || []).forEach((f) => formats.push({ ...f, mimeType: f.type }));
+      (data.formatStreams || []).forEach((f) => formats.push({ ...f, mimeType: f.type || f.mimeType }));
+      (data.adaptiveFormats || []).forEach((f) => formats.push({ ...f, mimeType: f.type || f.mimeType }));
 
       if (!formats.length) return null;
 
@@ -168,7 +305,7 @@ const fetchFromInvidious = async (id) => {
   return {
     provider: 'invidious',
     instance: result.instance,
-    streaming_data: result.data.streaming_data,
+    streaming_data: result.streaming_data,
   };
 };
 
@@ -178,6 +315,7 @@ const fetchFromInnertube = async (id) => {
 
   if (!info?.streaming_data) throw new Error('No streaming data');
 
+  // normalize somewhat to match our other code
   return {
     provider: 'innertube',
     streaming_data: info.streaming_data,
@@ -188,6 +326,8 @@ const fetchStreamingInfo = async (id) => {
   try {
     return await fetchFromInvidious(id);
   } catch (e) {
+    // fallback to innertube. Because innertube may also produce CDN URLs that are inaccessible,
+    // we will still return it and let the route handler do final verification before responding.
     return fetchFromInnertube(id);
   }
 };
@@ -235,7 +375,7 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
     if (!id) return res.status(400).json({ error: 'id required' });
 
     if (!isValidVideoId(id))
-      return res.status(400).json({error:"invalid video id"});
+      return res.status(400).json({ error: 'invalid video id' });
 
     const info = await fetchStreamingInfo(String(id));
     const sd = info.streaming_data || {};
@@ -250,6 +390,34 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
     const video = selectBestVideo(formats);
     const audio = selectBestAudio(formats);
 
+    // Progressive (muxed)
+    const progressive = selectBestProgressive(formats);
+
+    // Before returning, perform final CDN verification (important for Innertube fallback)
+    const ensureCdnOk = async () => {
+      if (video && audio) {
+        const v = parseUrl(video);
+        const a = parseUrl(audio);
+        if (!v || !a) return false;
+        return (await verifyCdn(v)) && (await verifyCdn(a));
+      }
+
+      if (progressive) {
+        const p = parseUrl(progressive);
+        if (!p) return false;
+        return await verifyCdn(p);
+      }
+
+      return false;
+    };
+
+    const cdnOk = await ensureCdnOk();
+    if (!cdnOk) {
+      // If this came from an Invidious instance, it should have been validated inside fastestFetch.
+      // If we ended up here via Innertube fallback and CDN check fails, return 502 (bad gateway).
+      return res.status(502).json({ error: 'cdn unreachable' });
+    }
+
     if (video && audio) {
       return res.json({
         type: 'dash',
@@ -260,14 +428,12 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
       });
     }
 
-    // Progressive (muxed)
-    const progressive = selectBestProgressive(formats);
     if (progressive) {
       return res.json({
         type: 'progressive',
         url: parseUrl(progressive),
         provider: info.provider,
-       instance: info.instance || null
+        instance: info.instance || null
       });
     }
 
