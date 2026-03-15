@@ -214,24 +214,6 @@ function isValidVideoId(id) {
   return typeof id === 'string' && YT_ID_REGEX.test(id);
 }
 
-const extractTitle = (info) => {
-  const raw = info?.raw || {};
-  // Common places where title is stored across providers
-  return (
-    raw.title ||
-    raw.videoDetails?.title ||
-    raw.video_details?.title ||
-    raw.basic_info?.title ||
-    raw.player_response?.videoDetails?.title ||
-    raw.microformat?.title?.simpleText ||
-    raw.meta?.title ||
-    raw.snippet?.title ||
-    raw.metadata?.title ||
-    raw.ytInitialPlayerResponse?.videoDetails?.title ||
-    ''
-  );
-};
-
 app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
   try {
     const id = req.query.id;
@@ -263,35 +245,24 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
       return (f.mime && f.mime.includes('mpegurl')) || url.includes('.m3u8') || /application\/vnd\.apple\.mpegurl/.test(f.mime || '');
     });
     if (containsHlsFormat) return res.status(403).json({ error: 'live streams are not supported' });
-
-    const title = extractTitle(info) || '';
-
     const video = selectBestVideo(formats);
     const audio = selectBestAudio(formats);
     if (video && audio) {
       return res.json({
-        resourceType: 'dash',
-        title,
-        videoUrl: parseUrl(video),
-        audioUrl: parseUrl(audio),
-        provider: {
-          name: info.provider || 'unknown',
-          url:
-            info.instance || null,
-        },
+        type: 'dash',
+        video_url: parseUrl(video),
+        audio_url: parseUrl(audio),
+        provider: info.provider,
+        instance: info.instance || null,
       });
     }
     const progressive = selectBestProgressive(formats);
     if (progressive) {
       return res.json({
-        resourceType: 'progressive',
-        title,
+        type: 'progressive',
         url: parseUrl(progressive),
-        provider: {
-          name: info.provider || 'unknown',
-          url:
-            info.instance || null,
-        },
+        provider: info.provider,
+        instance: info.instance || null,
       });
     }
     return res.status(404).json({ error: 'no stream' });
