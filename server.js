@@ -134,9 +134,7 @@ const extractGoogleHls = async (variantUrl, instance) => {
     const r = await fetch(url);
     if (!r.ok) return null;
     const txt = await r.text();
-    const m = txt.match(/https?:\/\/manifest\.googlevideo\.com\/[^
-
-]+/);
+    const m = txt.match(/https?:\\/\\/manifest\\.googlevideo\\.com\\/[^\\s"']+/);
     if (!m) return null;
     const gv = m[0];
     try {
