@@ -240,6 +240,42 @@ const fetchFromInnertube = async (id, { useProxy = false } = {}) => {
   };
 };
 
+// Helper: detect whether a provider response seems to represent a live/HLS/DASH stream
+const responseLooksLikeLiveOrManifest = (info) => {
+  if (!info || !info.streaming_data) return false;
+  const sd = info.streaming_data || {};
+
+  // quick manifest checks
+  const hasManifest = [
+    sd.hlsManifestUrl,
+    sd.hls_manifest_url,
+    sd.hlsUrl,
+    sd.hls,
+    sd.streamingData?.hlsManifestUrl,
+    sd.streamingData?.hls_manifest_url,
+    sd.dashManifestUrl,
+    sd.dash_manifest_url,
+    sd.streamingData?.dashManifestUrl,
+    sd.streamingData?.dash_manifest_url,
+  ].some(Boolean);
+  if (hasManifest) return true;
+
+  // check formats for m3u8 / apple mpegurl
+  const formats = normalizeFormats(sd);
+  const containsHlsFormat = formats.some((f) => {
+    const url = parseUrlFromFormat(f) || '';
+    return url.includes('.m3u8') || (f.mime && f.mime.includes('mpegurl')) || /application\/vnd\.apple\.mpegurl/.test(f.mime || '');
+  });
+  if (containsHlsFormat) return true;
+
+  // finally, explicit live flag
+  if (info.is_live) return true;
+
+  return false;
+};
+
+// === Invidious skip policy: do NOT ban by time, only skip when response is live/manifest ===
+
 // Top-level fetcher: order = proxied Innertube (if configured) -> Invidious -> direct Innertube
 const fetchStreamingInfo = async (id) => {
   // 1) proxied innertube (if PROXY_URL configured)
@@ -252,9 +288,16 @@ const fetchStreamingInfo = async (id) => {
     }
   }
 
-  // 2) invidious
+    // 2) invidious
   try {
-    return await fetchFromInvidious(id);
+    const invInfo = await fetchFromInvidious(id);
+
+    // If invidious result appears to be a live/HLS/DASH stream, just skip it (no ban, no timer)
+    if (responseLooksLikeLiveOrManifest(invInfo)) {
+      console.warn('Skipping Invidious result because it looks like live/manifest');
+    } else {
+      return invInfo;
+    }
   } catch (e) {
     console.warn('invidious failed, falling back to direct innertube:', e.message || e);
   }
