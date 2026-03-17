@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "express": "^4.19.0",
-    "youtubei.js": "latest"
+    "youtubei.js": "latest",
+    "undici": "^6.0.0"
   }
 }
