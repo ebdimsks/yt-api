@@ -1,9 +1,10 @@
 import express from 'express';
-import { Innertube } from 'youtubei.js';
+import { Innertube, Platform } from 'youtubei.js';
 import crypto from 'crypto';
+import { ProxyAgent } from 'undici';
 
 // Configuration
-const { WORKER_SECRET, PORT = 3000 } = process.env;
+const { WORKER_SECRET, PORT = 3000, PROXY_URL } = process.env;
 if (!WORKER_SECRET) {
   console.error('WORKER_SECRET is required');
   process.exit(1);
@@ -30,16 +31,34 @@ const INVIDIOUS_INSTANCES = [
   'https://yewtu.be',
 ];
 
-// Innertube client singleton
+// Innertube client singletons (direct and proxied)
 let ytClient = null;
-const getYtClient = async () => {
-  if (!ytClient) {
+let proxiedYtClient = null;
+const getYtClient = async (useProxy = false) => {
+  if (useProxy) {
+    if (proxiedYtClient) return proxiedYtClient;
+    if (!PROXY_URL) throw new Error('PROXY_URL not configured');
+    const proxyAgent = new ProxyAgent(PROXY_URL);
+    proxiedYtClient = await Innertube.create({
+      client_type: 'ANDROID',
+      generate_session_locally: true,
+      // override fetch to use undici ProxyAgent via youtubei.js Platform shim
+      fetch(input, init) {
+        return Platform.shim.fetch(input, {
+          ...init,
+          dispatcher: proxyAgent,
+        });
+      },
+    });
+    return proxiedYtClient;
+  } else {
+    if (ytClient) return ytClient;
     ytClient = await Innertube.create({
       client_type: 'ANDROID',
       generate_session_locally: true,
     });
+    return ytClient;
   }
-  return ytClient;
 };
 
 // Instance health tracking (simple in-memory)
@@ -196,11 +215,12 @@ const fetchFromInvidious = async (id) => {
   };
 };
 
-const fetchFromInnertube = async (id) => {
-  const client = await getYtClient();
+const fetchFromInnertube = async (id, { useProxy = false } = {}) => {
+  const client = await getYtClient(useProxy);
   const info = await client.getInfo(id);
-  if (!info?.streaming_data && !info?.player_response) throw new Error('No streaming data');
+  if (!info) throw new Error('No info from innertube');
 
+  // streaming data might be at different paths
   const sd = info.streaming_data || info.player_response?.streamingData || {};
   const is_live = Boolean(
     info?.video_details?.isLive ||
@@ -213,19 +233,34 @@ const fetchFromInnertube = async (id) => {
 
   return {
     provider: 'innertube',
+    instance: useProxy ? PROXY_URL : null,
     streaming_data: sd,
     is_live,
     raw: info,
   };
 };
 
-// Top-level fetcher: try invidious first, fall back to innertube
+// Top-level fetcher: order = proxied Innertube (if configured) -> Invidious -> direct Innertube
 const fetchStreamingInfo = async (id) => {
+  // 1) proxied innertube (if PROXY_URL configured)
+  if (PROXY_URL) {
+    try {
+      return await fetchFromInnertube(id, { useProxy: true });
+    } catch (e) {
+      // proceed to invidious fallback
+      console.warn('proxied innertube failed, falling back:', e.message || e);
+    }
+  }
+
+  // 2) invidious
   try {
     return await fetchFromInvidious(id);
   } catch (e) {
-    return fetchFromInnertube(id);
+    console.warn('invidious failed, falling back to direct innertube:', e.message || e);
   }
+
+  // 3) direct innertube (final fallback)
+  return fetchFromInnertube(id, { useProxy: false });
 };
 
 // Constant-time compare for signatures (accepts raw hex strings)
@@ -295,9 +330,12 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
 
     const info = await fetchStreamingInfo(id);
 
-    if (info.is_live) return res.status(403).json({ error: 'live streams are not supported' });
-
     const sd = info.streaming_data || {};
+
+    // If provider is not innertube, keep rejecting live streams as before.
+    if (info.is_live && info.provider !== 'innertube') {
+      return res.status(403).json({ error: 'live streams are not supported' });
+    }
 
     // quick check for HLS/DASH manifests (used for live variants)
     const hasManifest = [
@@ -313,26 +351,95 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
       sd.streamingData?.dash_manifest_url,
     ].some(Boolean);
 
-    if (hasManifest) return res.status(403).json({ error: 'live streams are not supported' });
+    // If manifest exists and provider is not innertube, reject (keep previous behavior).
+    if (hasManifest && info.provider !== 'innertube') {
+      return res.status(403).json({ error: 'live streams are not supported' });
+    }
 
     const formats = normalizeFormats(sd);
-    if (!formats.length) return res.status(404).json({ error: 'no stream' });
+    if (!formats.length && !hasManifest) return res.status(404).json({ error: 'no stream' });
 
+    // HLS-format in formats detection (e.g. m3u8). If found and not innertube, block.
     const containsHlsFormat = formats.some((f) => {
       const url = parseUrlFromFormat(f) || '';
       return (f.mime && f.mime.includes('mpegurl')) || url.includes('.m3u8') || /application\/vnd\.apple\.mpegurl/.test(f.mime || '');
     });
-    if (containsHlsFormat) return res.status(403).json({ error: 'live streams are not supported' });
+    if (containsHlsFormat && info.provider !== 'innertube') {
+      return res.status(403).json({ error: 'live streams are not supported' });
+    }
 
     const title = extractTitle(info) || '';
-
-    const video = selectBestVideo(formats);
-    const audio = selectBestAudio(formats);
 
     const providerObj = {
       name: info.provider || null,
       url: info.instance || null,
     };
+
+    // If provider is innertube and it's live or has manifest, prefer returning a manifest (HLS) when possible
+    if (info.provider === 'innertube' && (info.is_live || hasManifest || containsHlsFormat)) {
+      // prefer explicit manifest urls from streaming data
+      const manifestUrl =
+        sd.hlsManifestUrl ||
+        sd.hls_manifest_url ||
+        sd.hlsUrl ||
+        sd.hls ||
+        sd.streamingData?.hlsManifestUrl ||
+        sd.streamingData?.hls_manifest_url ||
+        sd.streamingData?.hlsUrl ||
+        sd.streamingData?.hls;
+
+      if (manifestUrl) {
+        return res.json({
+          resourcetype: 'hls',
+          title,
+          url: manifestUrl,
+          provider: providerObj,
+        });
+      }
+
+      // fallback: if formats contain direct m3u8 urls, return one
+      const hlsFormat = formats.find((f) => {
+        const url = parseUrlFromFormat(f) || '';
+        return url.includes('.m3u8') || (f.mime && f.mime.includes('mpegurl')) || /application\/vnd\.apple\.mpegurl/.test(f.mime || '');
+      });
+      if (hlsFormat) {
+        return res.json({
+          resourcetype: 'hls',
+          title,
+          url: parseUrlFromFormat(hlsFormat),
+          provider: providerObj,
+        });
+      }
+
+      // as a last resort for innertube live, attempt to return the best available dash/audio/video info
+      const videoLive = selectBestVideo(formats);
+      const audioLive = selectBestAudio(formats);
+      if (videoLive && audioLive) {
+        return res.json({
+          resourcetype: 'dash',
+          title,
+          videourl: parseUrlFromFormat(videoLive),
+          audiourl: parseUrlFromFormat(audioLive),
+          provider: providerObj,
+        });
+      }
+      const progressiveLive = selectBestProgressive(formats);
+      if (progressiveLive) {
+        return res.json({
+          resourcetype: 'progressive',
+          title,
+          url: parseUrlFromFormat(progressiveLive),
+          provider: providerObj,
+        });
+      }
+
+      // nothing usable found for innertube live
+      return res.status(404).json({ error: 'no stream' });
+    }
+
+    // Non-live / normal handling (same as before)
+    const video = selectBestVideo(formats);
+    const audio = selectBestAudio(formats);
 
     if (video && audio) {
       return res.json({
