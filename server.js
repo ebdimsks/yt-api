@@ -86,11 +86,13 @@ const verifyWorkerAuth = (req, res, next) => {
 const runYtDlp = async (videoId, { useProxy = false } = {}) => {
   const url = `https://www.youtube.com/watch?v=${videoId}`;
   const args = [
-    '--dump-single-json',
-    '--skip-download',
+    '--print-json',
     '--no-playlist',
     '--no-warnings',
     '--no-progress',
+    '--simulate',
+    '-f', 'bv*+ba/b',
+    '--extractor-args', 'youtube:player_client=android',
   ];
 
   if (useProxy && PROXY_URL) {
