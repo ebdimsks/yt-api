@@ -4,13 +4,12 @@ import crypto from 'crypto';
 import { spawn } from 'node:child_process';
 
 // ------------------------
-// Config
+// Environment / Constants
 // ------------------------
-const {
-  WORKER_SECRET,
-  PORT = 3000,
-  PROXY_URL,
-} = process.env;
+const WORKER_SECRET = process.env.WORKER_SECRET;
+const PROXY_URL = process.env.PROXY_URL;
+const YT_DLP_BIN = '/opt/venv/bin/yt-dlp';
+const PORT = Number(process.env.PORT || 3000);
 
 if (!WORKER_SECRET) {
   console.error('WORKER_SECRET is required');
@@ -18,148 +17,16 @@ if (!WORKER_SECRET) {
 }
 
 const app = express();
-const port = Number(PORT);
+app.disable('x-powered-by');
 
-const YT_DLP_BIN = '/opt/venv/bin/yt-dlp';
+const ALLOWED_WINDOW_SECONDS = 300;
+const REQUEST_TIMEOUT_MS = 5_000;
+const INSTANCE_BAN_MS = 5 * 60 * 1000;
+const YT_DLP_TIMEOUT_MS = 10_000;
+
 const YT_ID_REGEX = /^[a-zA-Z0-9_-]{11}$/;
 
-const TIMEOUT = 10000;
-
-// ------------------------
-// Auth
-// ------------------------
-const verifyWorkerAuth = (req, res, next) => {
-  const ts = req.header('x-proxy-timestamp');
-  const sig = req.header('x-proxy-signature');
-
-  if (!ts || !sig) return res.status(401).end();
-
-  const payload = `${ts}:${req.originalUrl}`;
-  const expected = crypto
-    .createHmac('sha256', WORKER_SECRET)
-    .update(payload)
-    .digest('hex');
-
-  if (expected !== sig) return res.status(401).end();
-
-  next();
-};
-
-// ------------------------
-// yt-dlp
-// ------------------------
-const runYtDlp = (id, { proxy = false } = {}) => {
-  const url = `https://www.youtube.com/watch?v=${id}`;
-
-  const args = [
-    '--dump-single-json',
-    '--no-playlist',
-    '--no-warnings',
-    '--no-progress',
-    '--skip-download',
-    url,
-  ];
-
-  if (proxy && PROXY_URL) {
-    args.unshift('--proxy', PROXY_URL);
-  }
-
-  return new Promise((resolve, reject) => {
-    const p = spawn(YT_DLP_BIN, args);
-
-    let out = '';
-    let err = '';
-
-    const t = setTimeout(() => p.kill('SIGKILL'), TIMEOUT);
-
-    p.stdout.on('data', d => out += d);
-    p.stderr.on('data', d => err += d);
-
-    p.on('close', code => {
-      clearTimeout(t);
-
-      if (code !== 0) {
-        return reject(new Error(err || 'yt-dlp failed'));
-      }
-
-      try {
-        resolve(JSON.parse(out));
-      } catch {
-        reject(new Error('invalid json'));
-      }
-    });
-  });
-};
-
-// ------------------------
-// Format normalize（最重要）
-// ------------------------
-const extractUrl = (f) => {
-  if (f.url) return f.url;
-
-  const cipher = f.signatureCipher || f.cipher;
-  if (!cipher) return null;
-
-  try {
-    return new URLSearchParams(cipher).get('url');
-  } catch {
-    return null;
-  }
-};
-
-const normalizeFormats = (raw = {}) => {
-  const list = [
-    ...(raw.formats || []),
-    ...(raw.requested_formats || []),
-  ];
-
-  return list
-    .map(f => {
-      const url = extractUrl(f);
-
-      return {
-        ...f,
-        url,
-        mime: String(f.mimeType || f.type || '').toLowerCase(),
-      };
-    })
-    .filter(f => f.url);
-};
-
-// ------------------------
-// Selector（品質最優先）
-// ------------------------
-const sortVideo = (a, b) =>
-  (b.height || 0) - (a.height || 0) ||
-  (b.fps || 0) - (a.fps || 0) ||
-  (b.bitrate || 0) - (a.bitrate || 0);
-
-const sortAudio = (a, b) =>
-  (b.abr || 0) - (a.abr || 0) ||
-  (b.bitrate || 0) - (a.bitrate || 0);
-
-const getBestVideo = (f) =>
-  f.filter(x => x.mime.includes('video') && !x.mime.includes('audio'))
-   .sort(sortVideo)[0];
-
-const getBestAudio = (f) =>
-  f.filter(x => x.mime.includes('audio'))
-   .sort(sortAudio)[0];
-
-const getBestMuxed = (f) =>
-  f.filter(x => x.mime.includes('video') && x.mime.includes('audio'))
-   .sort(sortVideo)[0];
-
-const getHLS = (f) =>
-  f.find(x =>
-    x.url.includes('.m3u8') ||
-    x.mime.includes('mpegurl')
-  );
-
-// ------------------------
-// Invidious（品質対応）
-// ------------------------
-const INVIDIOUS = [
+const INVIDIOUS_INSTANCES = [
   'https://inv.nadeko.net',
   'https://invidious.f5.si',
   'https://invidious.lunivers.trade',
@@ -170,49 +37,683 @@ const INVIDIOUS = [
   'https://yewtu.be',
 ];
 
-const fetchInv = async (id) => {
-  for (const base of INVIDIOUS) {
-    try {
-      const r = await fetch(`${base}/api/v1/videos/${id}`);
-      if (!r.ok) continue;
+const MANIFEST_KEYS = [
+  'hlsManifestUrl',
+  'hls_manifest_url',
+  'hlsUrl',
+  'hls',
+  'dashManifestUrl',
+  'dash_manifest_url',
+  'dashUrl',
+  'manifest_url',
+  'manifestUrl',
+];
 
-      const j = await r.json();
+// ------------------------
+// Small utils
+// ------------------------
+const toNumber = (value, fallback = 0) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+};
 
-      const formats = [
-        ...(j.formatStreams || []),
-        ...(j.adaptiveFormats || []),
-      ];
-
-      return {
-        raw: { formats },
-        provider: base,
-      };
-    } catch {}
+const safeEqualHex = (a, b) => {
+  try {
+    const A = Buffer.from(String(a), 'hex');
+    const B = Buffer.from(String(b), 'hex');
+    if (A.length !== B.length) return false;
+    return crypto.timingSafeEqual(A, B);
+  } catch {
+    return false;
   }
-  throw new Error('inv failed');
+};
+
+const isNonEmptyString = (v) => typeof v === 'string' && v.trim().length > 0;
+
+const isHlsUrl = (url) => /(^|[/?#&])[^?#]*\.m3u8(\?|#|$)/i.test(url) || /mpegurl/i.test(url);
+const isDashUrl = (url) => /(^|[/?#&])[^?#]*\.mpd(\?|#|$)/i.test(url) || /dash/i.test(url);
+
+const parseHeightFromLabel = (label) => {
+  const m = String(label || '').match(/(\d{3,4})p/i);
+  return m ? Number(m[1]) : 0;
+};
+
+const parseUrlFromFormat = (format) => {
+  if (!format) return null;
+  if (typeof format === 'string') return format;
+  if (isNonEmptyString(format.url)) return format.url;
+
+  const cipher = format.signatureCipher || format.signature_cipher || format.cipher;
+  if (!cipher) return null;
+
+  try {
+    const params = new URLSearchParams(cipher);
+    return params.get('url');
+  } catch {
+    return null;
+  }
+};
+
+const uniqByKey = (items, keyFn) => {
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    const key = keyFn(item);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+};
+
+const flattenArrays = (...values) =>
+  values.flatMap((v) => (Array.isArray(v) ? v : [])).filter(Boolean);
+
+// ------------------------
+// Auth
+// ------------------------
+const verifyWorkerAuth = (req, res, next) => {
+  const ts = req.header('x-proxy-timestamp');
+  const sig = req.header('x-proxy-signature');
+
+  if (!ts || !sig) return res.status(401).json({ error: 'unauthorized' });
+
+  const now = Math.floor(Date.now() / 1000);
+  const t = Number(ts);
+
+  if (!Number.isFinite(t) || Math.abs(now - t) > ALLOWED_WINDOW_SECONDS) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  const payload = `${ts}:${req.originalUrl}`;
+  const expected = crypto.createHmac('sha256', WORKER_SECRET).update(payload).digest('hex');
+
+  if (!safeEqualHex(expected, sig)) return res.status(401).json({ error: 'unauthorized' });
+
+  next();
 };
 
 // ------------------------
-// Fetch orchestration
+// yt-dlp
 // ------------------------
-const fetchInfo = async (id) => {
-  try {
-    if (PROXY_URL) {
-      return {
-        raw: await runYtDlp(id, { proxy: true }),
-        provider: 'yt-dlp(proxy)',
-      };
+const runYtDlp = async (videoId, { useProxy = false } = {}) => {
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  const args = [
+    '--dump-single-json',
+    '--skip-download',
+    '--no-playlist',
+    '--no-warnings',
+    '--no-progress',
+    '--format',
+    'bestvideo*+bestaudio/best',
+    '--extractor-args',
+    'youtube:player_client=android',
+  ];
+
+  if (useProxy && PROXY_URL) {
+    args.push('--proxy', PROXY_URL);
+  }
+
+  args.push(url);
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(YT_DLP_BIN, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+    }, YT_DLP_TIMEOUT_MS);
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString('utf8');
+    });
+
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf8');
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+
+      if (code !== 0) {
+        return reject(
+          new Error(
+            `yt-dlp failed (${code ?? signal ?? 'unknown'}): ${stderr.trim() || 'no stderr output'}`
+          )
+        );
+      }
+
+      const text = stdout.trim();
+      if (!text) {
+        return reject(new Error('yt-dlp returned empty output'));
+      }
+
+      try {
+        resolve(JSON.parse(text));
+        return;
+      } catch {}
+
+      const firstBrace = text.indexOf('{');
+      const lastBrace = text.lastIndexOf('}');
+      if (firstBrace >= 0 && lastBrace > firstBrace) {
+        try {
+          resolve(JSON.parse(text.slice(firstBrace, lastBrace + 1)));
+          return;
+        } catch {}
+      }
+
+      reject(new Error('yt-dlp returned invalid JSON'));
+    });
+  });
+};
+
+// ------------------------
+// Invidious
+// ------------------------
+const badInstances = new Map();
+let rrIndex = 0;
+
+const markInstanceBad = (instance) => {
+  badInstances.set(instance, Date.now());
+};
+
+const rotateInstances = (list = []) => {
+  if (!Array.isArray(list) || list.length === 0) return [];
+
+  const start = rrIndex % list.length;
+  rrIndex = (rrIndex + 1) % list.length;
+
+  const rotated = [...list.slice(start), ...list.slice(0, start)];
+
+  const now = Date.now();
+  const available = rotated.filter((inst) => {
+    const t = badInstances.get(inst);
+    if (!t) return true;
+    if (now - t > INSTANCE_BAN_MS) {
+      badInstances.delete(inst);
+      return true;
     }
-  } catch {}
+    return false;
+  });
+
+  return available.length ? available : rotated;
+};
+
+const fetchJsonWithTimeout = async (url, timeoutMs) => {
+  const controller = new AbortController();
+  let timedOut = false;
+
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
 
   try {
-    return await fetchInv(id);
-  } catch {}
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        accept: 'application/json',
+      },
+    });
+
+    if (!res.ok) {
+      throw new Error(`bad response ${res.status} from ${url}`);
+    }
+
+    return await res.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const fastestFetch = async (instances, buildUrl, parser) => {
+  if (!instances || !instances.length) throw new Error('no instances');
+
+  const controllers = [];
+
+  const tasks = instances.map((base) => {
+    return (async () => {
+      const controller = new AbortController();
+      controllers.push(controller);
+
+      let timedOut = false;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, REQUEST_TIMEOUT_MS);
+
+      try {
+        const res = await fetch(buildUrl(base), {
+          signal: controller.signal,
+          headers: {
+            accept: 'application/json',
+          },
+        });
+
+        if (!res.ok) {
+          markInstanceBad(base);
+          throw new Error(`bad response ${res.status} from ${base}`);
+        }
+
+        const json = await res.json();
+        const parsed = parser(json);
+
+        if (!parsed) {
+          markInstanceBad(base);
+          throw new Error(`parse failed from ${base}`);
+        }
+
+        return { instance: base, data: parsed };
+      } catch (err) {
+        const aborted = err?.name === 'AbortError';
+        if (timedOut || !aborted) {
+          markInstanceBad(base);
+        }
+        throw err;
+      } finally {
+        clearTimeout(timeout);
+      }
+    })();
+  });
+
+  try {
+    const result = await Promise.any(tasks);
+    controllers.forEach((c) => c.abort());
+    return result;
+  } catch {
+    controllers.forEach((c) => c.abort());
+    throw new Error('All instances failed');
+  }
+};
+
+const collectFormats = (raw = {}, sd = {}) => {
+  const sources = flattenArrays(
+    raw.formats,
+    raw.requested_formats,
+    raw.adaptiveFormats,
+    raw.adaptive_formats,
+    raw.formatStreams,
+    sd.formats,
+    sd.requested_formats,
+    sd.adaptiveFormats,
+    sd.adaptive_formats,
+    sd.formatStreams,
+    sd.streamingData?.formats,
+    sd.streamingData?.requested_formats,
+    sd.streamingData?.adaptiveFormats,
+    sd.streamingData?.adaptive_formats,
+    sd.streamingData?.formatStreams
+  );
+
+  const normalized = sources
+    .map((f) => {
+      if (!f || typeof f !== 'object') return null;
+
+      const url = parseUrlFromFormat(f);
+      const mime = String(f.mimeType || f.mime_type || f.type || '').toLowerCase();
+      const vcodec = String(f.vcodec || '').toLowerCase();
+      const acodec = String(f.acodec || '').toLowerCase();
+
+      return {
+        ...f,
+        url,
+        mime,
+        vcodec,
+        acodec,
+        width: toNumber(f.width, 0),
+        height: toNumber(f.height || parseHeightFromLabel(f.qualityLabel || f.resolution), 0),
+        fps: toNumber(f.fps, 0),
+        tbr: toNumber(f.tbr || f.bitrate || f.total_bitrate, 0),
+        abr: toNumber(f.abr || f.audioBitrate, 0),
+        vbr: toNumber(f.vbr, 0),
+        filesize: toNumber(f.filesize, 0),
+        filesize_approx: toNumber(f.filesize_approx, 0),
+        qualityLabel: String(f.qualityLabel || f.quality_label || f.resolution || ''),
+      };
+    })
+    .filter(Boolean);
+
+  return uniqByKey(normalized, (f) => {
+    const base =
+      f.url ||
+      String(f.itag || '') +
+        '|' +
+        String(f.format_id || '') +
+        '|' +
+        String(f.height || '') +
+        '|' +
+        String(f.width || '') +
+        '|' +
+        String(f.mime || '');
+    return base;
+  });
+};
+
+const hasManifestInSd = (sd = {}) =>
+  MANIFEST_KEYS.some((k) => Boolean(sd?.[k])) ||
+  MANIFEST_KEYS.some((k) => Boolean(sd?.streamingData?.[k]));
+
+const containsManifestLikeFormat = (formats = []) =>
+  formats.some((f) => {
+    const url = parseUrlFromFormat(f) || '';
+    return (
+      isHlsUrl(url) ||
+      isDashUrl(url) ||
+      /application\/vnd\.apple\.mpegurl/i.test(f.mime || '') ||
+      /application\/dash\+xml/i.test(f.mime || '')
+    );
+  });
+
+const extractTitle = (raw = {}) => {
+  return (
+    raw.title ||
+    raw.videoDetails?.title ||
+    raw.video_details?.title ||
+    raw.player_response?.videoDetails?.title ||
+    raw.basic_info?.title ||
+    raw.microformat?.title?.simpleText ||
+    (raw.titleText?.runs?.map?.((x) => x.text) || []).join('') ||
+    raw.video?.title ||
+    null
+  );
+};
+
+const isLiveLike = (raw = {}, sd = {}, formats = []) =>
+  Boolean(
+    raw.is_live ||
+      raw.live_status === 'is_live' ||
+      raw.liveNow ||
+      raw.isLive ||
+      raw.live ||
+      sd.isLive ||
+      hasManifestInSd(sd) ||
+      containsManifestLikeFormat(formats)
+  );
+
+const extractManifest = (raw = {}, sd = {}, isLive = false) => {
+  const candidates = [
+    { kind: 'dash', url: sd.dashManifestUrl },
+    { kind: 'dash', url: sd.dash_manifest_url },
+    { kind: 'dash', url: sd.dashUrl },
+    { kind: 'hls', url: sd.hlsManifestUrl },
+    { kind: 'hls', url: sd.hls_manifest_url },
+    { kind: 'hls', url: sd.hlsUrl },
+
+    { kind: 'dash', url: raw.dashManifestUrl },
+    { kind: 'dash', url: raw.dash_manifest_url },
+    { kind: 'dash', url: raw.dashUrl },
+    { kind: 'hls', url: raw.hlsManifestUrl },
+    { kind: 'hls', url: raw.hls_manifest_url },
+    { kind: 'hls', url: raw.hlsUrl },
+
+    { kind: null, url: sd.manifestUrl },
+    { kind: null, url: sd.manifest_url },
+    { kind: null, url: raw.manifestUrl },
+    { kind: null, url: raw.manifest_url },
+  ].filter((x) => isNonEmptyString(x.url));
+
+  if (!candidates.length) return null;
+
+  const inferKind = (item) => {
+    if (item.kind) return item.kind;
+    if (isHlsUrl(item.url)) return 'hls';
+    if (isDashUrl(item.url)) return 'dash';
+    return 'hls';
+  };
+
+  const ordered = candidates.map((item) => ({
+    url: item.url,
+    kind: inferKind(item),
+  }));
+
+  const preferredKinds = isLive ? ['hls', 'dash'] : ['dash', 'hls'];
+
+  for (const kind of preferredKinds) {
+    const hit = ordered.find((x) => x.kind === kind);
+    if (hit) return hit;
+  }
+
+  return ordered[0];
+};
+
+const isMuxedFormat = (f) =>
+  Boolean(
+    f &&
+      ((f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none') ||
+        (f.mime.includes('video') && f.mime.includes('audio')))
+  );
+
+const isVideoOnly = (f) =>
+  Boolean(
+    f &&
+      ((f.vcodec && f.vcodec !== 'none' && (!f.acodec || f.acodec === 'none')) ||
+        (f.mime.includes('video') && !f.mime.includes('audio')))
+  );
+
+const isAudioOnly = (f) =>
+  Boolean(
+    f &&
+      ((f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none')) ||
+        (f.mime.includes('audio') && !f.mime.includes('video')))
+  );
+
+const scoreVideoFormat = (f) => [
+  toNumber(f.height, 0),
+  toNumber(f.width, 0),
+  toNumber(f.fps, 0),
+  toNumber(f.tbr || f.vbr || f.abr, 0),
+  toNumber(f.filesize_approx || f.filesize, 0),
+];
+
+const scoreAudioFormat = (f) => [
+  toNumber(f.abr, 0),
+  toNumber(f.tbr || f.vbr, 0),
+  toNumber(f.filesize_approx || f.filesize, 0),
+];
+
+const compareVideoQuality = (a, b) => {
+  const A = scoreVideoFormat(a);
+  const B = scoreVideoFormat(b);
+  for (let i = 0; i < A.length; i++) {
+    if (B[i] !== A[i]) return B[i] - A[i];
+  }
+  return 0;
+};
+
+const compareAudioQuality = (a, b) => {
+  const A = scoreAudioFormat(a);
+  const B = scoreAudioFormat(b);
+  for (let i = 0; i < A.length; i++) {
+    if (B[i] !== A[i]) return B[i] - A[i];
+  }
+  return 0;
+};
+
+const selectBestMuxed = (formats = []) =>
+  [...formats].filter(isMuxedFormat).sort(compareVideoQuality)[0] || null;
+
+const selectBestVideo = (formats = []) =>
+  [...formats].filter(isVideoOnly).sort(compareVideoQuality)[0] ||
+  [...formats].filter((f) => f.mime.includes('video')).sort(compareVideoQuality)[0] ||
+  null;
+
+const selectBestAudio = (formats = []) =>
+  [...formats].filter(isAudioOnly).sort(compareAudioQuality)[0] ||
+  [...formats].filter((f) => f.mime.includes('audio')).sort(compareAudioQuality)[0] ||
+  null;
+
+const buildSdFromRaw = (raw = {}) => {
+  const sd = {
+    formats: Array.isArray(raw.formats) ? raw.formats : [],
+    requested_formats: Array.isArray(raw.requested_formats) ? raw.requested_formats : [],
+  };
+
+  for (const key of MANIFEST_KEYS) {
+    if (raw[key]) sd[key] = raw[key];
+  }
+
+  if (raw.streamingData && typeof raw.streamingData === 'object') {
+    sd.streamingData = raw.streamingData;
+  }
+
+  return sd;
+};
+
+const normalizeResourceChoice = (raw = {}, sd = {}, preferDirect = true) => {
+  const formats = collectFormats(raw, sd);
+  const live = isLiveLike(raw, sd, formats);
+
+  const manifest = extractManifest(raw, sd, live);
+  if (manifest) {
+    return {
+      kind: manifest.kind,
+      url: manifest.url,
+      source: 'manifest',
+    };
+  }
+
+  const hlsFormat = formats.find((f) => {
+    const url = parseUrlFromFormat(f) || '';
+    return (
+      isHlsUrl(url) ||
+      /application\/vnd\.apple\.mpegurl/i.test(f.mime || '') ||
+      /mpegurl/i.test(f.mime || '')
+    );
+  });
+
+  if (hlsFormat) {
+    return {
+      kind: 'hls',
+      url: parseUrlFromFormat(hlsFormat),
+      source: 'format',
+    };
+  }
+
+  const muxed = selectBestMuxed(formats);
+  const video = selectBestVideo(formats);
+  const audio = selectBestAudio(formats);
+
+  if (preferDirect && muxed) {
+    return {
+      kind: 'progressive',
+      url: parseUrlFromFormat(muxed),
+      source: 'muxed',
+    };
+  }
+
+  if (video && audio) {
+    return {
+      kind: 'dash',
+      videourl: parseUrlFromFormat(video),
+      audiourl: parseUrlFromFormat(audio),
+      source: 'dash',
+    };
+  }
+
+  if (muxed) {
+    return {
+      kind: 'progressive',
+      url: parseUrlFromFormat(muxed),
+      source: 'muxed',
+    };
+  }
+
+  return null;
+};
+
+// ------------------------
+// Providers
+// ------------------------
+const fetchFromYtDlp = async (id, { useProxy = false } = {}) => {
+  const raw = await runYtDlp(id, { useProxy });
+  const sd = buildSdFromRaw(raw);
+  const formats = collectFormats(raw, sd);
+  const is_live = isLiveLike(raw, sd, formats);
 
   return {
-    raw: await runYtDlp(id),
     provider: 'yt-dlp',
+    instance: useProxy ? (PROXY_URL || null) : null,
+    streaming_data: sd,
+    is_live,
+    raw,
   };
+};
+
+const parseInvidiousVideo = (data) => {
+  if (!data || typeof data !== 'object') return null;
+
+  const formats = collectFormats(data, data);
+  const is_live = Boolean(
+    data.liveNow ||
+      data.isLive ||
+      data.is_live ||
+      data.live ||
+      data.live_status === 'is_live' ||
+      data.streamingData?.isLive ||
+      containsManifestLikeFormat(formats)
+  );
+
+  const sd = {
+    formats: Array.isArray(data.formats) ? data.formats : [],
+    requested_formats: Array.isArray(data.requested_formats) ? data.requested_formats : [],
+    streamingData: data.streamingData && typeof data.streamingData === 'object' ? data.streamingData : undefined,
+  };
+
+  return {
+    streaming_data: sd,
+    is_live,
+    raw: data,
+  };
+};
+
+const fetchFromInvidious = async (id) => {
+  const instances = rotateInstances(INVIDIOUS_INSTANCES);
+
+  const result = await fastestFetch(
+    instances,
+    (base) => `${base.replace(/\/$/, '')}/api/v1/videos/${id}`,
+    parseInvidiousVideo
+  );
+
+  return {
+    provider: 'invidious',
+    instance: result.instance,
+    streaming_data: result.data.streaming_data,
+    is_live: result.data.is_live,
+    raw: result.data.raw,
+  };
+};
+
+const fetchStreamingInfo = async (id) => {
+  if (PROXY_URL) {
+    try {
+      return await fetchFromYtDlp(id, { useProxy: true });
+    } catch (e) {
+      console.warn('proxied yt-dlp failed, falling back to direct yt-dlp:', e?.message || e);
+    }
+  }
+
+  try {
+    return await fetchFromYtDlp(id, { useProxy: false });
+  } catch (e) {
+    console.warn('direct yt-dlp failed, falling back to invidious:', e?.message || e);
+  }
+
+  try {
+    return await fetchFromInvidious(id);
+  } catch (e) {
+    console.warn('invidious failed:', e?.message || e);
+    throw new Error('all providers failed');
+  }
 };
 
 // ------------------------
@@ -221,70 +722,73 @@ const fetchInfo = async (id) => {
 app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
   try {
     const id = String(req.query.id || '');
+    if (!id) return res.status(400).json({ error: 'id required' });
+    if (!YT_ID_REGEX.test(id)) return res.status(400).json({ error: 'invalid video id' });
 
-    if (!YT_ID_REGEX.test(id)) {
-      return res.status(400).json({ error: 'invalid id' });
+    const info = await fetchStreamingInfo(id);
+    const sd = info.streaming_data || {};
+    const raw = info.raw || {};
+    const formats = collectFormats(raw, sd);
+
+    if (!formats.length && !hasManifestInSd(sd) && !containsManifestLikeFormat(formats)) {
+      return res.status(404).json({ error: 'no stream' });
     }
 
-    const info = await fetchInfo(id);
-    const formats = normalizeFormats(info.raw);
+    const title = extractTitle(raw) || '';
+    const provider = {
+      name: info.provider || null,
+      url: info.instance || null,
+    };
 
-    if (!formats.length) {
-      return res.status(404).json({ error: 'no usable stream (empty formats)' });
-    }
+    const choice = normalizeResourceChoice(raw, sd, true);
 
-    // ---- HLS（ライブ）
-    const hls = getHLS(formats);
-    if (hls) {
+    if (choice) {
+      if (choice.kind === 'dash') {
+        if (choice.videourl && choice.audiourl) {
+          return res.json({
+            resourcetype: 'dash',
+            title,
+            videourl: choice.videourl,
+            audiourl: choice.audiourl,
+            provider,
+          });
+        }
+
+        // DASH manifest fallback
+        return res.json({
+          resourcetype: 'dash',
+          title,
+          url: choice.url,
+          provider,
+        });
+      }
+
+      if (choice.kind === 'progressive') {
+        return res.json({
+          resourcetype: 'progressive',
+          title,
+          url: choice.url,
+          provider,
+        });
+      }
+
+      // HLS or generic manifest fallback
       return res.json({
         resourcetype: 'hls',
-        url: hls.url,
-        provider: info.provider,
+        title,
+        url: choice.url,
+        provider,
       });
     }
 
-    // ---- DASH（最高品質）
-    const video = getBestVideo(formats);
-    const audio = getBestAudio(formats);
-
-    if (video && audio) {
-      return res.json({
-        resourcetype: 'dash',
-        videourl: video.url,
-        audiourl: audio.url,
-        provider: info.provider,
-      });
-    }
-
-    // ---- fallback（mux）
-    const muxed = getBestMuxed(formats);
-    if (muxed) {
-      return res.json({
-        resourcetype: 'progressive',
-        url: muxed.url,
-        provider: info.provider,
-      });
-    }
-
-    // ---- 最終fallback（videoのみでも返す）
-    const any = formats.sort(sortVideo)[0];
-    if (any) {
-      return res.json({
-        resourcetype: 'fallback',
-        url: any.url,
-        provider: info.provider,
-      });
-    }
-
-    return res.status(404).json({ error: 'no usable stream' });
-
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
+    return res.status(404).json({ error: 'no stream' });
+  } catch (err) {
+    console.error('Unexpected error in /api/stream', err);
+    return res.status(500).json({ error: err?.message || 'internal error' });
   }
 });
 
 // ------------------------
-app.listen(port, () => {
-  console.log(`Server running on ${port}`);
-});
+// Server start
+// ------------------------
+app.listen(PORT, () => console.log(`Server running on ${PORT}`));
