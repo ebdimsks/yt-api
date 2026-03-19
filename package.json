@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "start": "node yt-dlp_test.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.0",
