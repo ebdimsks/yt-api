@@ -20,7 +20,7 @@ const ALLOWED_WINDOW_SECONDS = 300;
 const REQUEST_TIMEOUT_MS = 5_000;
 const INSTANCE_BAN_MS = 5 * 60 * 1000;
 const YT_DLP_TIMEOUT_MS = 10_000;
-const YT_DLP_BIN = '/usr/local/bin/yt-dlp';
+const YT_DLP_BIN = '/opt/venv/bin/yt-dlp';
 const YT_ID_REGEX = /^[a-zA-Z0-9_-]{11}$/;
 
 const INVIDIOUS_INSTANCES = [
