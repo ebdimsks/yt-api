@@ -153,6 +153,8 @@ const runYtDlp = async (videoId, { useProxy = false } = {}) => {
     '--no-progress',
     '--extractor-args',
     'youtube:player_client=android',
+    '--format',
+    'bv*+ba/b',
   ];
 
   if (useProxy && PROXY_URL) {
