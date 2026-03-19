@@ -1,16 +1,21 @@
 FROM node:20-bookworm-slim
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      ffmpeg \
-      python3 \
-      curl \
-      ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+ENV DEBIAN_FRONTEND=noninteractive
 
-RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-    -o /usr/local/bin/yt-dlp && \
-    chmod 755 /usr/local/bin/yt-dlp
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        gnupg \
+        ffmpeg \
+        python3 \
+        curl \
+        ca-certificates \
+    && update-ca-certificates \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+    -o /usr/local/bin/yt-dlp \
+    && chmod +x /usr/local/bin/yt-dlp
 
 WORKDIR /app
 
