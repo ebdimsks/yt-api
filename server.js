@@ -6,20 +6,13 @@ import { spawn } from 'node:child_process';
 // ------------------------
 // Environment / Constants
 // ------------------------
-const WORKER_SECRET = process.env.WORKER_SECRET;
 const PROXY_URL = process.env.PROXY_URL;
 const YT_DLP_BIN = '/opt/venv/bin/yt-dlp';
 const PORT = Number(process.env.PORT || 3000);
 
-if (!WORKER_SECRET) {
-  console.error('WORKER_SECRET is required');
-  process.exit(1);
-}
-
 const app = express();
 app.disable('x-powered-by');
 
-const ALLOWED_WINDOW_SECONDS = 300;
 const REQUEST_TIMEOUT_MS = 5_000;
 const INSTANCE_BAN_MS = 5 * 60 * 1000;
 const YT_DLP_TIMEOUT_MS = 10_000;
@@ -57,6 +50,8 @@ const toNumber = (value, fallback = 0) => {
   return Number.isFinite(n) ? n : fallback;
 };
 
+const isNonEmptyString = (v) => typeof v === 'string' && v.trim().length > 0;
+
 const safeEqualHex = (a, b) => {
   try {
     const A = Buffer.from(String(a), 'hex');
@@ -68,10 +63,43 @@ const safeEqualHex = (a, b) => {
   }
 };
 
-const isNonEmptyString = (v) => typeof v === 'string' && v.trim().length > 0;
+const isPlainObject = (value) =>
+  Boolean(value) &&
+  typeof value === 'object' &&
+  !Array.isArray(value) &&
+  Object.prototype.toString.call(value) === '[object Object]';
 
-const isHlsUrl = (url) => /(^|[/?#&])[^?#]*\.m3u8(\?|#|$)/i.test(url) || /mpegurl/i.test(url);
-const isDashUrl = (url) => /(^|[/?#&])[^?#]*\.mpd(\?|#|$)/i.test(url) || /dash/i.test(url);
+const snippet = (text, len = 220) => {
+  const s = String(text ?? '').replace(/\s+/g, ' ').trim();
+  return s.length > len ? `${s.slice(0, len)}…` : s;
+};
+
+const parseStrictJsonObject = (text, context = 'json') => {
+  const trimmed = String(text ?? '').trim();
+
+  if (!trimmed) {
+    throw new Error(`${context}: empty output`);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (err) {
+    throw new Error(`${context}: invalid JSON (${snippet(trimmed)})`);
+  }
+
+  if (!isPlainObject(parsed)) {
+    throw new Error(`${context}: JSON must be an object`);
+  }
+
+  return parsed;
+};
+
+const isHlsUrl = (url) =>
+  /(^|[/?#&])[^?#]*\.m3u8(\?|#|$)/i.test(url) || /mpegurl/i.test(url);
+
+const isDashUrl = (url) =>
+  /(^|[/?#&])[^?#]*\.mpd(\?|#|$)/i.test(url) || /dash/i.test(url);
 
 const parseHeightFromLabel = (label) => {
   const m = String(label || '').match(/(\d{3,4})p/i);
@@ -117,30 +145,6 @@ const pickRequestedFormats = (raw = {}, sd = {}) =>
   ).filter((v) => v && typeof v === 'object');
 
 // ------------------------
-// Auth
-// ------------------------
-const verifyWorkerAuth = (req, res, next) => {
-  const ts = req.header('x-proxy-timestamp');
-  const sig = req.header('x-proxy-signature');
-
-  if (!ts || !sig) return res.status(401).json({ error: 'unauthorized' });
-
-  const now = Math.floor(Date.now() / 1000);
-  const t = Number(ts);
-
-  if (!Number.isFinite(t) || Math.abs(now - t) > ALLOWED_WINDOW_SECONDS) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-
-  const payload = `${ts}:${req.originalUrl}`;
-  const expected = crypto.createHmac('sha256', WORKER_SECRET).update(payload).digest('hex');
-
-  if (!safeEqualHex(expected, sig)) return res.status(401).json({ error: 'unauthorized' });
-
-  next();
-};
-
-// ------------------------
 // yt-dlp
 // ------------------------
 const runYtDlp = async (videoId, { useProxy = false } = {}) => {
@@ -153,27 +157,44 @@ const runYtDlp = async (videoId, { useProxy = false } = {}) => {
     '--no-progress',
     '--format',
     'bestvideo*+bestaudio/best',
+    url,
   ];
 
   if (useProxy && PROXY_URL) {
-    args.push('--proxy', PROXY_URL);
+    args.splice(args.length - 1, 0, '--proxy', PROXY_URL);
   }
-
-  args.push(url);
 
   return new Promise((resolve, reject) => {
     const child = spawn(YT_DLP_BIN, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
     });
 
     let stdout = '';
     let stderr = '';
+    let stdoutBytes = 0;
+    let settled = false;
+
+    const done = (err, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) reject(err);
+      else resolve(value);
+    };
 
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
+      done(new Error('yt-dlp timed out'));
     }, YT_DLP_TIMEOUT_MS);
 
     child.stdout.on('data', (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > MAX_STDOUT_BYTES) {
+        child.kill('SIGKILL');
+        done(new Error('yt-dlp stdout too large'));
+        return;
+      }
       stdout += chunk.toString('utf8');
     });
 
@@ -182,41 +203,27 @@ const runYtDlp = async (videoId, { useProxy = false } = {}) => {
     });
 
     child.on('error', (err) => {
-      clearTimeout(timer);
-      reject(err);
+      done(err);
     });
 
     child.on('close', (code, signal) => {
-      clearTimeout(timer);
+      if (settled) return;
 
       if (code !== 0) {
-        return reject(
+        done(
           new Error(
-            `yt-dlp failed (${code ?? signal ?? 'unknown'}): ${stderr.trim() || 'no stderr output'}`
+            `yt-dlp failed (${code ?? signal ?? 'unknown'}): ${snippet(stderr) || 'no stderr output'}`
           )
         );
-      }
-
-      const text = stdout.trim();
-      if (!text) {
-        return reject(new Error('yt-dlp returned empty output'));
+        return;
       }
 
       try {
-        resolve(JSON.parse(text));
-        return;
-      } catch {}
-
-      const firstBrace = text.indexOf('{');
-      const lastBrace = text.lastIndexOf('}');
-      if (firstBrace >= 0 && lastBrace > firstBrace) {
-        try {
-          resolve(JSON.parse(text.slice(firstBrace, lastBrace + 1)));
-          return;
-        } catch {}
+        const parsed = parseStrictJsonObject(stdout, 'yt-dlp stdout');
+        done(null, parsed);
+      } catch (err) {
+        done(err);
       }
-
-      reject(new Error('yt-dlp returned invalid JSON'));
     });
   });
 };
@@ -258,50 +265,48 @@ const fastestFetch = async (instances, buildUrl, parser) => {
 
   const controllers = [];
 
-  const tasks = instances.map((base) => {
-    return (async () => {
-      const controller = new AbortController();
-      controllers.push(controller);
+  const tasks = instances.map((base) => (async () => {
+    const controller = new AbortController();
+    controllers.push(controller);
 
-      let timedOut = false;
-      const timeout = setTimeout(() => {
-        timedOut = true;
-        controller.abort();
-      }, REQUEST_TIMEOUT_MS);
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, REQUEST_TIMEOUT_MS);
 
-      try {
-        const res = await fetch(buildUrl(base), {
-          signal: controller.signal,
-          headers: {
-            accept: 'application/json',
-          },
-        });
+    try {
+      const res = await fetch(buildUrl(base), {
+        signal: controller.signal,
+        headers: { accept: 'application/json' },
+      });
 
-        if (!res.ok) {
-          markInstanceBad(base);
-          throw new Error(`bad response ${res.status} from ${base}`);
-        }
-
-        const json = await res.json();
-        const parsed = parser(json);
-
-        if (!parsed) {
-          markInstanceBad(base);
-          throw new Error(`parse failed from ${base}`);
-        }
-
-        return { instance: base, data: parsed };
-      } catch (err) {
-        const aborted = err?.name === 'AbortError';
-        if (timedOut || !aborted) {
-          markInstanceBad(base);
-        }
-        throw err;
-      } finally {
-        clearTimeout(timeout);
+      if (!res.ok) {
+        markInstanceBad(base);
+        throw new Error(`bad response ${res.status} from ${base}`);
       }
-    })();
-  });
+
+      const json = await res.json();
+      if (!isPlainObject(json)) {
+        markInstanceBad(base);
+        throw new Error(`non-object JSON from ${base}`);
+      }
+
+      const parsed = parser(json);
+      if (!parsed) {
+        markInstanceBad(base);
+        throw new Error(`parse failed from ${base}`);
+      }
+
+      return { instance: base, data: parsed };
+    } catch (err) {
+      const aborted = err?.name === 'AbortError';
+      if (timedOut || !aborted) markInstanceBad(base);
+      throw err;
+    } finally {
+      clearTimeout(timeout);
+    }
+  })());
 
   try {
     const result = await Promise.any(tasks);
@@ -337,7 +342,7 @@ const collectFormats = (raw = {}, sd = {}) => {
 
   const normalized = sources
     .map((f) => {
-      if (!f || typeof f !== 'object') return null;
+      if (!isPlainObject(f)) return null;
 
       const url = parseUrlFromFormat(f);
       const mime = String(f.mimeType || f.mime_type || f.type || '').toLowerCase();
@@ -364,43 +369,32 @@ const collectFormats = (raw = {}, sd = {}) => {
     .filter(Boolean);
 
   return uniqByKey(normalized, (f) => {
-    const base =
+    return (
       f.url ||
-      String(f.itag || '') +
-        '|' +
-        String(f.format_id || '') +
-        '|' +
-        String(f.height || '') +
-        '|' +
-        String(f.width || '') +
-        '|' +
-        String(f.mime || '');
-    return base;
+      `${String(f.itag || '')}|${String(f.format_id || '')}|${String(f.height || '')}|${String(f.width || '')}|${String(f.mime || '')}`
+    );
   });
 };
 
-const extractTitle = (raw = {}) => {
-  return (
-    raw.title ||
-    raw.videoDetails?.title ||
-    raw.video_details?.title ||
-    raw.player_response?.videoDetails?.title ||
-    raw.basic_info?.title ||
-    raw.microformat?.title?.simpleText ||
-    (raw.titleText?.runs?.map?.((x) => x.text) || []).join('') ||
-    raw.video?.title ||
-    null
-  );
-};
+const extractTitle = (raw = {}) =>
+  raw.title ||
+  raw.videoDetails?.title ||
+  raw.video_details?.title ||
+  raw.player_response?.videoDetails?.title ||
+  raw.basic_info?.title ||
+  raw.microformat?.title?.simpleText ||
+  (raw.titleText?.runs?.map?.((x) => x.text) || []).join('') ||
+  raw.video?.title ||
+  null;
 
-const isLiveLike = (raw = {}, sd = {}, formats = []) =>
+const isLiveLike = (raw = {}, sd = {}) =>
   Boolean(
     raw.is_live ||
-      raw.live_status === 'is_live' ||
-      raw.liveNow ||
-      raw.isLive ||
-      raw.live ||
-      sd.isLive
+    raw.live_status === 'is_live' ||
+    raw.liveNow ||
+    raw.isLive ||
+    raw.live ||
+    sd.isLive
   );
 
 const extractManifest = (raw = {}, sd = {}, isLive = false) => {
@@ -452,22 +446,22 @@ const extractManifest = (raw = {}, sd = {}, isLive = false) => {
 const isMuxedFormat = (f) =>
   Boolean(
     f &&
-      ((f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none') ||
-        (f.mime.includes('video') && f.mime.includes('audio')))
+    ((f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none') ||
+      (f.mime.includes('video') && f.mime.includes('audio')))
   );
 
 const isVideoOnly = (f) =>
   Boolean(
     f &&
-      ((f.vcodec && f.vcodec !== 'none' && (!f.acodec || f.acodec === 'none')) ||
-        (f.mime.includes('video') && !f.mime.includes('audio')))
+    ((f.vcodec && f.vcodec !== 'none' && (!f.acodec || f.acodec === 'none')) ||
+      (f.mime.includes('video') && !f.mime.includes('audio')))
   );
 
 const isAudioOnly = (f) =>
   Boolean(
     f &&
-      ((f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none')) ||
-        (f.mime.includes('audio') && !f.mime.includes('video')))
+    ((f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none')) ||
+      (f.mime.includes('audio') && !f.mime.includes('video')))
   );
 
 const scoreVideoFormat = (f) => [
@@ -525,7 +519,7 @@ const buildSdFromRaw = (raw = {}) => {
     if (raw[key]) sd[key] = raw[key];
   }
 
-  if (raw.streamingData && typeof raw.streamingData === 'object') {
+  if (raw.streamingData && isPlainObject(raw.streamingData)) {
     sd.streamingData = raw.streamingData;
   }
 
@@ -567,18 +561,16 @@ const selectDashFromRequested = (raw = {}, sd = {}) => {
 
 const normalizeResourceChoice = (raw = {}, sd = {}) => {
   const formats = collectFormats(raw, sd);
-  const is_live = isLiveLike(raw, sd, formats);
+  const live = isLiveLike(raw, sd);
 
-  if (is_live) {
+  if (live) {
     const manifest = extractManifest(raw, sd, true);
-    if (manifest) {
-      return {
-        kind: manifest.kind,
-        url: manifest.url,
-        source: 'manifest',
-      };
-    }
-    return null;
+    if (!manifest) return null;
+    return {
+      kind: manifest.kind,
+      url: manifest.url,
+      source: 'manifest',
+    };
   }
 
   const requestedDash = selectDashFromRequested(raw, sd);
@@ -615,24 +607,26 @@ const normalizeResourceChoice = (raw = {}, sd = {}) => {
 // ------------------------
 const fetchFromYtDlp = async (id, { useProxy = false } = {}) => {
   const raw = await runYtDlp(id, { useProxy });
+  if (!isPlainObject(raw)) throw new Error('yt-dlp returned non-object JSON');
+
   const sd = buildSdFromRaw(raw);
   const formats = collectFormats(raw, sd);
-  const is_live = isLiveLike(raw, sd, formats);
+  const live = isLiveLike(raw, sd);
 
   return {
     provider: useProxy ? 'yt-dlp (proxy)' : 'yt-dlp (direct)',
     streaming_data: sd,
-    is_live,
+    is_live: live,
     raw,
+    formats,
   };
 };
 
 const parseInvidiousVideo = (data) => {
-  if (!data || typeof data !== 'object') return null;
+  if (!isPlainObject(data)) return null;
 
   const sd = buildSdFromRaw(data);
-
-  const is_live = Boolean(
+  const live = Boolean(
     data.liveNow ||
     data.isLive ||
     data.is_live ||
@@ -641,13 +635,13 @@ const parseInvidiousVideo = (data) => {
     sd.streamingData?.isLive
   );
 
-  if (is_live) {
+  if (live) {
     throw new Error('skip live on invidious');
   }
 
   return {
     streaming_data: sd,
-    is_live,
+    is_live: live,
     raw: data,
   };
 };
@@ -684,18 +678,65 @@ const fetchStreamingInfo = async (id) => {
     console.warn('invidious failed, falling back to direct yt-dlp:', e?.message || e);
   }
 
-  try {
-    return await fetchFromYtDlp(id, { useProxy: false });
-  } catch (e) {
-    console.warn('direct yt-dlp failed:', e?.message || e);
-    throw new Error('all providers failed');
+  return await fetchFromYtDlp(id, { useProxy: false });
+};
+
+const buildStreamResponse = ({ info, raw, sd, title, res }) => {
+  const formats = collectFormats(raw, sd);
+  const live = isLiveLike(raw, sd);
+
+  if (live) {
+    const manifest = extractManifest(raw, sd, true);
+    if (!manifest) {
+      return res.status(404).json({ error: 'no stream' });
+    }
+
+    return res.json({
+      resourcetype: manifest.kind || 'hls',
+      title,
+      url: manifest.url,
+      provider: info.provider,
+    });
   }
+
+  if (!formats.length) {
+    return res.status(404).json({ error: 'no stream' });
+  }
+
+  const choice = normalizeResourceChoice(raw, sd);
+  if (!choice) {
+    return res.status(404).json({ error: 'no stream' });
+  }
+
+  if (choice.kind === 'dash') {
+    if (choice.videourl && choice.audiourl) {
+      return res.json({
+        resourcetype: 'dash',
+        title,
+        videourl: choice.videourl,
+        audiourl: choice.audiourl,
+        provider: info.provider,
+      });
+    }
+    return res.status(404).json({ error: 'no stream' });
+  }
+
+  if (choice.kind === 'progressive') {
+    return res.json({
+      resourcetype: 'progressive',
+      title,
+      url: choice.url,
+      provider: info.provider,
+    });
+  }
+
+  return res.status(404).json({ error: 'no stream' });
 };
 
 // ------------------------
 // API
 // ------------------------
-app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
+app.get('/api/stream', async (req, res) => {
   try {
     const id = String(req.query.id || '');
     if (!id) return res.status(400).json({ error: 'id required' });
@@ -704,58 +745,9 @@ app.get('/api/stream', verifyWorkerAuth, async (req, res) => {
     const info = await fetchStreamingInfo(id);
     const sd = info.streaming_data || {};
     const raw = info.raw || {};
-    const formats = collectFormats(raw, sd);
-    const is_live = isLiveLike(raw, sd, formats);
-
     const title = extractTitle(raw) || '';
 
-    if (is_live) {
-      const manifest = extractManifest(raw, sd, true);
-      if (!manifest) {
-        return res.status(404).json({ error: 'no stream' });
-      }
-
-      return res.json({
-        resourcetype: manifest.kind || 'hls',
-        title,
-        url: manifest.url,
-        provider: info.provider,
-      });
-    }
-
-    if (!formats.length) {
-      return res.status(404).json({ error: 'no stream' });
-    }
-
-    const choice = normalizeResourceChoice(raw, sd);
-
-    if (!choice) {
-      return res.status(404).json({ error: 'no stream' });
-    }
-
-    if (choice.kind === 'dash') {
-      if (choice.videourl && choice.audiourl) {
-        return res.json({
-          resourcetype: 'dash',
-          title,
-          videourl: choice.videourl,
-          audiourl: choice.audiourl,
-          provider: info.provider,
-        });
-      }
-      return res.status(404).json({ error: 'no stream' });
-    }
-
-    if (choice.kind === 'progressive') {
-      return res.json({
-        resourcetype: 'progressive',
-        title,
-        url: choice.url,
-        provider: info.provider,
-      });
-    }
-
-    return res.status(404).json({ error: 'no stream' });
+    return buildStreamResponse({ info, raw, sd, title, res });
   } catch (err) {
     console.error('Unexpected error in /api/stream', err);
     return res.status(500).json({ error: err?.message || 'internal error' });
