@@ -190,11 +190,6 @@ const runYtDlp = async (videoId, { useProxy = false } = {}) => {
 
     child.stdout.on('data', (chunk) => {
       stdoutBytes += chunk.length;
-      if (stdoutBytes > MAX_STDOUT_BYTES) {
-        child.kill('SIGKILL');
-        done(new Error('yt-dlp stdout too large'));
-        return;
-      }
       stdout += chunk.toString('utf8');
     });
 
